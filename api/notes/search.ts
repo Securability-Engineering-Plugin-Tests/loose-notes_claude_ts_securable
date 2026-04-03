@@ -1,56 +1,63 @@
+/**
+ * GET /api/notes/search?q=keyword
+ *
+ * SSEM enforcements:
+ * - Integrity: parameterised search (PRD §12.2 required raw string concatenation)
+ * - Resilience: pagination prevents unbounded result sets
+ * - Availability: rate-limited
+ */
+
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { z } from 'zod';
-import { handleCors, applySecurityHeaders } from '../_lib/cors.js';
-import { noteStore, ratingStore, userStore } from '../_lib/store.js';
-import { extractToken, verifyToken } from '../_lib/auth.js';
-import { buildNoteListItem } from './_noteHelpers.js';
+import { requireAuth } from '../_lib/auth.js';
+import { noteRepo, userRepo, ratingRepo } from '../_lib/db.js';
+import { SearchSchema } from '../_lib/validation.js';
+import { checkRateLimit, RATE_LIMITS } from '../_lib/rateLimit.js';
 
-const searchQuerySchema = z.object({
-  q: z.string().min(1).max(200),
-  page: z.coerce.number().int().min(1).default(1),
-  limit: z.coerce.number().int().min(1).max(50).default(20),
-});
-
-export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
-  if (handleCors(req, res)) return;
-  applySecurityHeaders(res);
-
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET') {
-    res.status(405).json({ ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'GET required' } });
-    return;
+    return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'GET required' });
   }
 
-  // Optional auth — affects which private notes are visible
-  const token = extractToken(req);
-  const payload = token ? await verifyToken(token) : null;
-  const requestingUserId = payload?.sub ?? null;
+  const claims = await requireAuth(req, res);
+  if (!claims) return;
 
-  const parsed = searchQuerySchema.safeParse(req.query);
+  const ip = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0].trim() ?? 'unknown';
+  if (!checkRateLimit(`search:${ip}`, RATE_LIMITS.API_GENERAL).allowed) {
+    return res.status(429).json({ code: 'TOO_MANY_REQUESTS', message: 'Rate limit exceeded' });
+  }
+
+  const parsed = SearchSchema.safeParse(req.query);
   if (!parsed.success) {
-    res.status(400).json({ ok: false, error: { code: 'VALIDATION_ERROR', message: 'Invalid search parameters' } });
-    return;
+    return res.status(400).json({ code: 'VALIDATION_ERROR', message: parsed.error.issues[0].message });
   }
+  const { q, page, pageSize } = parsed.data;
 
-  const { q, page, limit } = parsed.data;
-  // Canonicalize search term — sanitize for safe comparison (Integrity)
-  const term = q.normalize('NFC').trim().toLowerCase();
-
-  const allNotes = noteStore.list().filter((n) => {
-    // Visibility rule: public notes OR notes owned by the requester
-    if (n.visibility !== 'public' && n.ownerId !== requestingUserId) return false;
-    // Case-insensitive match on title or content (Integrity — no SQL injection risk in in-memory)
-    return n.title.toLowerCase().includes(term) || n.content.toLowerCase().includes(term);
-  });
-
-  const total = allNotes.length;
-  const offset = (page - 1) * limit;
-  const pageItems = allNotes
+  // The search keyword is passed to a typed predicate, not concatenated into a query string
+  const allResults = noteRepo.search(q, claims.sub);
+  const total = allResults.length;
+  const items = allResults
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-    .slice(offset, offset + limit)
-    .map((n) => buildNoteListItem(n, ratingStore.findByNoteId(n.id), userStore));
+    .slice((page - 1) * pageSize, page * pageSize)
+    .map(note => {
+      const owner = userRepo.findById(note.ownerId);
+      const ratings = ratingRepo.findByNoteId(note.id);
+      const avg = ratings.length
+        ? ratings.reduce((s, r) => s + r.score, 0) / ratings.length
+        : undefined;
+      return {
+        id: note.id,
+        title: note.title,
+        // Content snippet for search results
+        contentSnippet: note.content.slice(0, 200),
+        isPublic: note.isPublic,
+        ownerId: note.ownerId,
+        ownerUsername: owner?.username ?? 'unknown',
+        createdAt: note.createdAt,
+        updatedAt: note.updatedAt,
+        averageRating: avg,
+        ratingCount: ratings.length,
+      };
+    });
 
-  res.status(200).json({
-    ok: true,
-    data: { items: pageItems, total, page, limit, hasMore: offset + limit < total },
-  });
+  return res.status(200).json({ items, total, page, pageSize });
 }

@@ -1,33 +1,10 @@
-# Dependencies
 node_modules/
-.pnp
-.pnp.js
-
-# Build output
 dist/
-.vercel/
-
-# Environment files - NEVER commit secrets
+build/
 .env
-.env.local
-.env.*.local
-
-# Editor
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
 *.log
-npm-debug.log*
-
-# TypeScript
-*.tsbuildinfo
-
-# Testing
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
 coverage/

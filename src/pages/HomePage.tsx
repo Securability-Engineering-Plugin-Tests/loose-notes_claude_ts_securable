@@ -1,46 +1,52 @@
+import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { FileText, Search, Star, Shield } from 'lucide-react';
-import { Button } from '@/components/ui/Button';
-import { useAuthStore, selectIsAuthenticated } from '@/store/authStore';
+import { noteService } from '../services/noteService';
+import NoteCard from '../components/notes/NoteCard';
+import type { Note } from '../types';
+import { useAuth } from '../context/AuthContext';
 
-export function HomePage() {
-  const isAuthenticated = useAuthStore(selectIsAuthenticated);
+export default function HomePage() {
+  const { user } = useAuth();
+  const [topNotes, setTopNotes] = useState<Note[]>([]);
+
+  useEffect(() => {
+    void noteService.getTopRated({ pageSize: 6 }).then(r => setTopNotes(r.items)).catch(() => {});
+  }, []);
 
   return (
-    <div className="max-w-4xl mx-auto text-center">
-      <div className="py-16">
-        <h1 className="text-4xl font-bold text-gray-900 mb-4">Loose Notes</h1>
-        <p className="text-xl text-gray-600 mb-8 max-w-2xl mx-auto">
-          A secure note-taking platform. Create, share, and discover notes with built-in rating and search.
+    <div className="space-y-12">
+      {/* Hero */}
+      <section className="text-center py-16">
+        <h1 className="text-4xl font-bold text-gray-900 mb-4">LooseNotes</h1>
+        <p className="text-lg text-gray-500 mb-8 max-w-xl mx-auto">
+          Create, share, and discover text notes. Rate and comment on community content.
         </p>
-
-        {isAuthenticated ? (
-          <div className="flex gap-3 justify-center">
-            <Link to="/notes"><Button size="lg">My Notes</Button></Link>
-            <Link to="/top-rated"><Button variant="secondary" size="lg">Top Rated</Button></Link>
-          </div>
+        {user ? (
+          <Link to="/notes/new" className="bg-brand-600 hover:bg-brand-700 text-white px-6 py-3 rounded-lg text-sm font-medium">
+            Create a note
+          </Link>
         ) : (
-          <div className="flex gap-3 justify-center">
-            <Link to="/register"><Button size="lg">Get started</Button></Link>
-            <Link to="/login"><Button variant="secondary" size="lg">Sign in</Button></Link>
+          <div className="flex justify-center gap-4">
+            <Link to="/register" className="bg-brand-600 hover:bg-brand-700 text-white px-6 py-3 rounded-lg text-sm font-medium">Get started</Link>
+            <Link to="/login" className="border border-gray-300 hover:bg-gray-50 text-gray-700 px-6 py-3 rounded-lg text-sm font-medium">Log in</Link>
           </div>
         )}
-      </div>
+      </section>
 
-      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4 py-8">
-        {[
-          { icon: FileText, title: 'Create Notes', desc: 'Rich text notes with file attachments. Public or private.' },
-          { icon: Search, title: 'Search', desc: 'Full-text search across all public notes and your own.' },
-          { icon: Star, title: 'Rate & Review', desc: 'Rate notes 1-5 stars with optional comments.' },
-          { icon: Shield, title: 'Secure by Design', desc: 'Built with FIASSE/SSEM securable engineering principles.' },
-        ].map(({ icon: Icon, title, desc }) => (
-          <div key={title} className="bg-white rounded-lg border p-6 text-left">
-            <Icon className="w-8 h-8 text-primary-600 mb-3" />
-            <h3 className="font-semibold text-gray-900 mb-2">{title}</h3>
-            <p className="text-sm text-gray-600">{desc}</p>
+      {/* Top rated */}
+      {topNotes.length > 0 && (
+        <section>
+          <div className="flex justify-between items-center mb-4">
+            <h2 className="text-xl font-semibold text-gray-900">Top Rated Notes</h2>
+            <Link to="/top-rated" className="text-sm text-brand-600 hover:underline">View all</Link>
           </div>
-        ))}
-      </div>
+          <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {topNotes.map(note => (
+              <NoteCard key={note.id} note={note} showOwner />
+            ))}
+          </div>
+        </section>
+      )}
     </div>
   );
 }

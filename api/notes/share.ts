@@ -1,65 +1,96 @@
+/**
+ * POST /api/notes/share       — Generate a share link for a note (owner only)
+ * GET  /api/notes/share/:token — Retrieve a shared note without authentication
+ *
+ * SSEM enforcements:
+ * - Integrity: share token uses crypto.randomBytes (PRD §10.2 required sequential int)
+ * - Authenticity: generation requires ownership verification
+ * - Confidentiality: private note content only exposed via valid token
+ */
+
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { randomBytes } from 'crypto';
-import { handleCors, applySecurityHeaders } from '../_lib/cors.js';
-import { requireAuth } from '../_lib/auth.js';
-import { noteStore, shareLinkStore } from '../_lib/store.js';
-import { audit } from '../_lib/audit.js';
+import { requireAuth, requireCsrf } from '../_lib/auth.js';
+import { noteRepo, userRepo, ratingRepo, attachmentRepo } from '../_lib/db.js';
+import { generateShareToken } from '../_lib/crypto.js';
+import { logger } from '../_lib/logger.js';
+import { z } from 'zod';
 
-export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
-  if (handleCors(req, res)) return;
-  applySecurityHeaders(res);
+const GenerateShareSchema = z.object({ noteId: z.string().uuid() });
 
-  const ctx = await requireAuth(req, res);
-  if (!ctx) return;
-
-  const noteId = typeof req.query.noteId === 'string' ? req.query.noteId : null;
-  if (!noteId) {
-    res.status(400).json({ ok: false, error: { code: 'BAD_REQUEST', message: 'noteId required' } });
-    return;
-  }
-
-  const note = noteStore.findById(noteId);
-  if (!note) {
-    res.status(404).json({ ok: false, error: { code: 'NOT_FOUND', message: 'Note not found' } });
-    return;
-  }
-
-  if (note.ownerId !== ctx.userId && ctx.role !== 'admin') {
-    res.status(403).json({ ok: false, error: { code: 'FORBIDDEN', message: 'Not the note owner' } });
-    return;
-  }
-
+export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // Generate share link — requires authentication and ownership
   if (req.method === 'POST') {
-    return handleCreate(req, res, noteId, ctx);
+    const claims = await requireAuth(req, res);
+    if (!claims) return;
+    if (!requireCsrf(req, res)) return;
+
+    const parsed = GenerateShareSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ code: 'VALIDATION_ERROR', message: parsed.error.issues[0].message });
+    }
+
+    const note = noteRepo.findById(parsed.data.noteId);
+    if (!note) {
+      return res.status(404).json({ code: 'NOT_FOUND', message: 'Note not found' });
+    }
+    if (note.ownerId !== claims.sub) {
+      return res.status(403).json({ code: 'FORBIDDEN', message: 'You do not own this note' });
+    }
+
+    // Cryptographically secure random token — not sequential
+    const token = generateShareToken();
+    noteRepo.update(note.id, { shareToken: token });
+
+    const baseUrl = process.env.APP_BASE_URL ?? '';
+    logger.audit('note.share_link.created', {
+      action: 'create_share_link',
+      userId: claims.sub,
+      resource: note.id,
+      outcome: 'success',
+    });
+
+    return res.status(200).json({
+      url: `${baseUrl}/share/${token}`,
+      token,
+    });
   }
 
-  if (req.method === 'DELETE') {
-    return handleRevoke(req, res, noteId, ctx);
+  // Retrieve shared note — public endpoint, no auth required
+  if (req.method === 'GET') {
+    const tokenResult = z.string().min(1).max(100).safeParse(req.query.token);
+    if (!tokenResult.success) {
+      return res.status(400).json({ code: 'INVALID_TOKEN', message: 'Invalid share token' });
+    }
+
+    const note = noteRepo.findByShareToken(tokenResult.data);
+    if (!note) {
+      return res.status(404).json({ code: 'NOT_FOUND', message: 'Shared note not found' });
+    }
+
+    const owner = userRepo.findById(note.ownerId);
+    const ratings = ratingRepo.findByNoteId(note.id);
+    const attachments = attachmentRepo.listByNote(note.id).map(a => ({
+      id: a.id,
+      filename: a.filename,
+      originalName: a.originalName,
+      contentType: a.contentType,
+      size: a.size,
+    }));
+    const avg = ratings.length
+      ? ratings.reduce((s, r) => s + r.score, 0) / ratings.length
+      : undefined;
+
+    return res.status(200).json({
+      id: note.id,
+      title: note.title,
+      content: note.content,
+      ownerUsername: owner?.username ?? 'unknown',
+      createdAt: note.createdAt,
+      attachments,
+      averageRating: avg,
+      ratingCount: ratings.length,
+    });
   }
 
-  res.status(405).json({ ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'POST or DELETE required' } });
-}
-
-function handleCreate(req: VercelRequest, res: VercelResponse, noteId: string, ctx: { userId: string; username: string }): void {
-  // Revoke any existing share link before creating new one (regenerate)
-  shareLinkStore.deleteByNoteId(noteId);
-
-  const token = randomBytes(24).toString('hex');
-  const link = shareLinkStore.create({
-    id: `sl-${token.slice(0, 8)}`,
-    noteId,
-    token,
-    createdAt: new Date().toISOString(),
-    expiresAt: null,
-  });
-
-  audit({ userId: ctx.userId, username: ctx.username, action: 'note.share_create', resourceType: 'share_link', resourceId: noteId, outcome: 'success', req });
-
-  res.status(201).json({ ok: true, data: { token: link.token } });
-}
-
-function handleRevoke(req: VercelRequest, res: VercelResponse, noteId: string, ctx: { userId: string; username: string }): void {
-  shareLinkStore.deleteByNoteId(noteId);
-  audit({ userId: ctx.userId, username: ctx.username, action: 'note.share_revoke', resourceType: 'share_link', resourceId: noteId, outcome: 'success', req });
-  res.status(200).json({ ok: true, data: { message: 'Share link revoked' } });
+  return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'GET or POST required' });
 }

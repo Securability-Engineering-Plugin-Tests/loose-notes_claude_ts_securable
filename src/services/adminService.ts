@@ -1,24 +1,20 @@
-import { apiRequest } from './api';
-import { ApiError } from './authService';
-import type { User, AdminDashboardStats } from '@/types';
+import { api } from './api';
+import type { User, AdminStats } from '../types';
 
-export async function getDashboardStats(): Promise<AdminDashboardStats> {
-  const result = await apiRequest<AdminDashboardStats>('/api/admin/dashboard');
-  if (!result.ok) throw new ApiError(result.error);
-  return result.data;
-}
+export const adminService = {
+  async getStats(): Promise<AdminStats> {
+    return api.get<AdminStats>('/admin?action=stats');
+  },
 
-export async function getUsers(search?: string): Promise<User[]> {
-  const params = search ? `?q=${encodeURIComponent(search)}` : '';
-  const result = await apiRequest<User[]>(`/api/admin/users${params}`);
-  if (!result.ok) throw new ApiError(result.error);
-  return result.data;
-}
+  async getUsers(): Promise<User[]> {
+    return api.get<User[]>('/admin?action=users');
+  },
 
-export async function reassignNote(noteId: string, newOwnerId: string): Promise<void> {
-  const result = await apiRequest('/api/admin/reassign', {
-    method: 'POST',
-    body: { noteId, newOwnerId },
-  });
-  if (!result.ok) throw new ApiError(result.error);
-}
+  async getAllNotes(): Promise<Array<{ id: string; title: string; ownerId: string; isPublic: boolean; createdAt: string }>> {
+    return api.get('/admin?action=notes');
+  },
+
+  async reassignNote(noteId: string, targetUserId: string): Promise<{ message: string }> {
+    return api.post('/admin?action=reassign', { noteId, targetUserId });
+  },
+};

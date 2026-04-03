@@ -1,53 +1,60 @@
+/**
+ * SSEM: Integrity — note title and content snippet are rendered via JSX
+ * (which HTML-escapes by default). No dangerouslySetInnerHTML here.
+ * PRD §6.2 required inserting content directly without encoding.
+ */
+
+import React from 'react';
 import { Link } from 'react-router-dom';
-import { Lock, Globe, Star, Calendar, User } from 'lucide-react';
-import { formatDistanceToNow } from 'date-fns';
-import { Badge } from '@/components/ui/Badge';
-import type { NoteListItem } from '@/types';
+import type { Note } from '../../types';
 
 interface NoteCardProps {
-  note: NoteListItem;
+  note: Note;
   showOwner?: boolean;
+  onDelete?: (id: string) => void;
 }
 
-export function NoteCard({ note, showOwner = false }: NoteCardProps) {
-  const isPublic = note.visibility === 'public';
-
+export default function NoteCard({ note, showOwner = false, onDelete }: NoteCardProps) {
   return (
-    <article className="bg-white rounded-lg border border-gray-200 shadow-sm hover:shadow-md transition-shadow p-4">
-      <div className="flex items-start justify-between gap-2 mb-2">
-        <Link
-          to={`/notes/${note.id}`}
-          className="text-gray-900 font-semibold hover:text-primary-700 line-clamp-2 flex-1"
-        >
-          {note.title}
-        </Link>
-        <Badge variant={isPublic ? 'success' : 'default'}>
-          {isPublic ? <Globe className="w-3 h-3 inline mr-1" /> : <Lock className="w-3 h-3 inline mr-1" />}
-          {isPublic ? 'Public' : 'Private'}
-        </Badge>
-      </div>
-
-      {note.excerpt && (
-        <p className="text-gray-600 text-sm line-clamp-3 mb-3">{note.excerpt}</p>
-      )}
-
-      <div className="flex items-center gap-4 text-xs text-gray-500">
-        {showOwner && (
-          <span className="flex items-center gap-1">
-            <User className="w-3 h-3" /> {note.ownerUsername}
-          </span>
-        )}
-        <span className="flex items-center gap-1">
-          <Calendar className="w-3 h-3" />
-          {formatDistanceToNow(new Date(note.createdAt), { addSuffix: true })}
+    <div className="bg-white rounded-lg border border-gray-200 p-4 shadow-sm hover:shadow-md transition-shadow">
+      <div className="flex justify-between items-start mb-2">
+        {/* title is JSX-escaped — safe against stored XSS */}
+        <h3 className="text-lg font-medium text-gray-900 truncate">{note.title}</h3>
+        <span className={`text-xs px-2 py-0.5 rounded-full ${note.isPublic ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'}`}>
+          {note.isPublic ? 'Public' : 'Private'}
         </span>
-        {note.averageRating !== null && (
-          <span className="flex items-center gap-1 text-yellow-600">
-            <Star className="w-3 h-3 fill-yellow-400" />
-            {note.averageRating.toFixed(1)} ({note.ratingCount})
-          </span>
-        )}
       </div>
-    </article>
+
+      {/* Content snippet — JSX-escaped, not rendered as HTML */}
+      <p className="text-sm text-gray-600 line-clamp-2 mb-3">
+        {note.content.replace(/<[^>]+>/g, '').slice(0, 200)}
+      </p>
+
+      <div className="flex items-center justify-between text-xs text-gray-400">
+        <div className="flex items-center gap-3">
+          {showOwner && <span>by {note.ownerUsername}</span>}
+          <span>{new Date(note.createdAt).toLocaleDateString()}</span>
+          {note.averageRating !== undefined && (
+            <span>★ {note.averageRating.toFixed(1)} ({note.ratingCount})</span>
+          )}
+        </div>
+        <div className="flex gap-2">
+          <Link
+            to={`/notes/${encodeURIComponent(note.id)}`}
+            className="text-brand-600 hover:text-brand-800"
+          >
+            View
+          </Link>
+          {onDelete && (
+            <button
+              onClick={() => onDelete(note.id)}
+              className="text-red-500 hover:text-red-700"
+            >
+              Delete
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }

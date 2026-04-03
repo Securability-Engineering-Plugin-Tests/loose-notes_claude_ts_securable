@@ -1,41 +1,74 @@
+/**
+ * POST /api/auth/reset-password
+ *
+ * Step 2 of password recovery: verify security answer + reset token,
+ * then update password if both match.
+ *
+ * SSEM enforcements:
+ * - Confidentiality: current password is NEVER returned to client (PRD §4.3 required this)
+ * - Integrity: server-side token consumed atomically; answer verified against hash
+ * - Availability: rate-limited; token expires after 30 minutes
+ * - Accountability: password resets logged
+ */
+
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import bcrypt from 'bcryptjs';
-import { z } from 'zod';
-import { handleCors, applySecurityHeaders } from '../_lib/cors.js';
-import { userStore, resetTokenStore } from '../_lib/store.js';
-import { parseBody } from '../_lib/validate.js';
-import { audit } from '../_lib/audit.js';
+import { ResetPasswordSchema } from '../_lib/validation.js';
+import { userRepo, resetTokenRepo } from '../_lib/db.js';
+import { verifySecurityAnswer, hashPassword } from '../_lib/crypto.js';
+import { checkRateLimit, RATE_LIMITS } from '../_lib/rateLimit.js';
+import { logger } from '../_lib/logger.js';
 
-const resetSchema = z.object({
-  token: z.string().min(1).max(200),
-  password: z.string().min(8).max(128).regex(/[A-Z]/).regex(/[a-z]/).regex(/[0-9]/),
-});
-
-export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
-  if (handleCors(req, res)) return;
-  applySecurityHeaders(res);
-
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
-    res.status(405).json({ ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'POST required' } });
-    return;
+    return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'POST required' });
   }
 
-  const body = parseBody(req.body, resetSchema, res);
-  if (!body) return;
-
-  const tokenRecord = resetTokenStore.find(body.token);
-
-  if (!tokenRecord || tokenRecord.used || tokenRecord.expiresAt < Date.now()) {
-    // Generic message to avoid token validity enumeration
-    res.status(400).json({ ok: false, error: { code: 'INVALID_TOKEN', message: 'Invalid or expired reset token' } });
-    return;
+  const ip = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0].trim() ?? 'unknown';
+  const rateLimitResult = checkRateLimit(`reset-password:${ip}`, RATE_LIMITS.PASSWORD_RECOVERY);
+  if (!rateLimitResult.allowed) {
+    return res.status(429).json({ code: 'TOO_MANY_REQUESTS', message: 'Too many attempts. Try again later.' });
   }
 
-  const passwordHash = await bcrypt.hash(body.password, 12);
-  userStore.update(tokenRecord.userId, { passwordHash });
-  resetTokenStore.invalidate(body.token);
+  const parsed = ResetPasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ code: 'VALIDATION_ERROR', message: parsed.error.issues[0].message });
+  }
+  const { token, securityAnswer, newPassword } = parsed.data;
 
-  audit({ userId: tokenRecord.userId, action: 'user.password_reset_complete', resourceType: 'user', resourceId: tokenRecord.userId, outcome: 'success', req });
+  // Consume the token (single-use, time-limited)
+  const resetRecord = resetTokenRepo.consume(token);
+  if (!resetRecord) {
+    logger.warn('auth.reset_password.invalid_token', { ip });
+    return res.status(400).json({ code: 'INVALID_TOKEN', message: 'Invalid or expired reset token' });
+  }
 
-  res.status(200).json({ ok: true, data: { message: 'Password reset successfully' } });
+  const user = userRepo.findById(resetRecord.userId);
+  if (!user) {
+    return res.status(400).json({ code: 'INVALID_TOKEN', message: 'Invalid or expired reset token' });
+  }
+
+  // Verify security answer against the stored hash
+  const answerValid = await verifySecurityAnswer(securityAnswer, user.securityAnswerHash);
+  if (!answerValid) {
+    logger.audit('auth.reset_password.answer_wrong', {
+      action: 'reset_password',
+      userId: user.id,
+      ip,
+      outcome: 'failure',
+    });
+    return res.status(400).json({ code: 'WRONG_ANSWER', message: 'Incorrect security answer' });
+  }
+
+  const newHash = await hashPassword(newPassword);
+  userRepo.update(user.id, { passwordHash: newHash });
+
+  logger.audit('auth.reset_password.success', {
+    action: 'reset_password',
+    userId: user.id,
+    ip,
+    outcome: 'success',
+  });
+
+  // Password is NOT returned. User must log in with the new password.
+  return res.status(200).json({ message: 'Password updated successfully. Please log in.' });
 }

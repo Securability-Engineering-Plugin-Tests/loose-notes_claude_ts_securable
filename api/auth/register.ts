@@ -1,81 +1,71 @@
+/**
+ * POST /api/auth/register
+ *
+ * SSEM enforcements:
+ * - Integrity: full password policy enforcement (PRD §16.2 required none)
+ * - Confidentiality: password hashed with bcrypt before storage
+ * - Accountability: registration events logged
+ * - Availability: rate-limited to prevent account-creation abuse
+ */
+
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { randomUUID } from 'crypto';
-import bcrypt from 'bcryptjs';
-import { z } from 'zod';
-import { handleCors, applySecurityHeaders, checkRateLimit } from '../_lib/cors.js';
-import { userStore } from '../_lib/store.js';
-import { signToken, setAuthCookie } from '../_lib/auth.js';
-import { parseBody } from '../_lib/validate.js';
-import { audit } from '../_lib/audit.js';
+import { RegisterSchema } from '../_lib/validation.js';
+import { userRepo, seedIfEmpty } from '../_lib/db.js';
+import { hashPassword, hashSecurityAnswer } from '../_lib/crypto.js';
+import { checkRateLimit, RATE_LIMITS } from '../_lib/rateLimit.js';
+import { logger } from '../_lib/logger.js';
 
-// ASVS V2.1 (Password Security), V2.4 (Credential Storage)
-const registerSchema = z.object({
-  username: z
-    .string()
-    .min(3)
-    .max(30)
-    .regex(/^[a-zA-Z0-9_-]+$/, 'Invalid username'),
-  email: z.string().email().max(254).toLowerCase(),
-  password: z
-    .string()
-    .min(8)
-    .max(128)
-    .regex(/[A-Z]/)
-    .regex(/[a-z]/)
-    .regex(/[0-9]/),
-});
-
-export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
-  if (handleCors(req, res)) return;
-  applySecurityHeaders(res);
-
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
-    res.status(405).json({ ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'POST required' } });
-    return;
+    return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'POST required' });
   }
 
-  // Rate limit by IP to prevent account enumeration (Availability)
-  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() ?? 'unknown';
-  if (!checkRateLimit(`register:${ip}`)) {
-    res.status(429).json({ ok: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
-    return;
+  await seedIfEmpty();
+
+  const ip = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0].trim() ?? 'unknown';
+  const rateLimitResult = checkRateLimit(`register:${ip}`, RATE_LIMITS.AUTH);
+  if (!rateLimitResult.allowed) {
+    return res.status(429).json({ code: 'TOO_MANY_REQUESTS', message: 'Too many requests. Try again later.' });
   }
 
-  const body = parseBody(req.body, registerSchema, res);
-  if (!body) return;
+  // Canonicalize → validate
+  const parsed = RegisterSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ code: 'VALIDATION_ERROR', message: parsed.error.issues[0].message });
+  }
+  const { username, email, password, securityQuestion, securityAnswer } = parsed.data;
 
-  // Check uniqueness — constant-time path to avoid username/email enumeration
-  const existingByUsername = userStore.findByUsername(body.username);
-  const existingByEmail = userStore.findByEmail(body.email);
-
-  if (existingByUsername || existingByEmail) {
-    audit({ userId: null, action: 'user.register', resourceType: 'user', outcome: 'failure', details: 'duplicate_username_or_email', req });
-    res.status(409).json({ ok: false, error: { code: 'CONFLICT', message: 'Username or email already exists' } });
-    return;
+  // Check uniqueness — specific messages are acceptable at registration
+  if (userRepo.findByUsername(username)) {
+    return res.status(409).json({ code: 'USERNAME_TAKEN', message: 'Username is already in use' });
+  }
+  if (userRepo.findByEmail(email)) {
+    return res.status(409).json({ code: 'EMAIL_TAKEN', message: 'Email address is already registered' });
   }
 
-  // Hash password with bcrypt (cost factor 12) — ASVS V2.4
-  const passwordHash = await bcrypt.hash(body.password, 12);
+  const [passwordHash, securityAnswerHash] = await Promise.all([
+    hashPassword(password),
+    hashSecurityAnswer(securityAnswer),
+  ]);
 
-  const user = userStore.create({
-    id: randomUUID(),
-    username: body.username,
-    email: body.email,
-    role: 'user',
+  const user = userRepo.create({
+    username,
+    email,
     passwordHash,
-    createdAt: new Date().toISOString(),
+    role: 'user',
+    securityQuestion,
+    securityAnswerHash,
   });
 
-  const token = await signToken({ userId: user.id, username: user.username, role: user.role });
-  setAuthCookie(res, token);
+  logger.audit('auth.register.success', {
+    action: 'register',
+    userId: user.id,
+    ip,
+    outcome: 'success',
+  });
 
-  audit({ userId: user.id, action: 'user.register', resourceType: 'user', resourceId: user.id, outcome: 'success', req });
-
-  res.status(201).json({
-    ok: true,
-    data: {
-      user: { id: user.id, username: user.username, email: user.email, role: user.role, createdAt: user.createdAt, noteCount: 0 },
-      token,
-    },
+  return res.status(201).json({
+    message: 'Account created successfully',
+    userId: user.id,
   });
 }

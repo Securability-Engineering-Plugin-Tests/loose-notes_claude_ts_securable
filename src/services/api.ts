@@ -1,70 +1,85 @@
-// Base API client — trust boundary between frontend and backend
-// Applies: request sanitization, auth headers, structured error handling
-// FIASSE: canonical response parsing, no secrets in error output
+/**
+ * Base API client.
+ *
+ * SSEM: Authenticity — includes CSRF token on all mutating requests.
+ * SSEM: Resilience — handles network errors and API error responses uniformly.
+ *
+ * The CSRF token is read from the in-memory store (set at login) rather than
+ * from localStorage to reduce XSS-accessible token exposure.
+ */
 
-const BASE_URL = import.meta.env.VITE_API_URL ?? '';
+let csrfToken: string | null = null;
 
-// Token stored in memory (not localStorage) to reduce XSS surface
-// httpOnly cookie handles persistence; this is for Bearer header fallback
-let _memoryToken: string | null = null;
-
-export function setMemoryToken(token: string | null): void {
-  _memoryToken = token;
+/** Set the CSRF token after login. */
+export function setCsrfToken(token: string): void {
+  csrfToken = token;
 }
 
-export function getMemoryToken(): string | null {
-  return _memoryToken;
+/** Clear the CSRF token on logout. */
+export function clearCsrfToken(): void {
+  csrfToken = null;
 }
+
+type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH';
 
 interface RequestOptions {
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  method?: HttpMethod;
   body?: unknown;
-  signal?: AbortSignal;
+  headers?: Record<string, string>;
 }
 
-// Generic fetch wrapper — canonicalize request, parse response envelope
-export async function apiRequest<T>(
-  path: string,
-  options: RequestOptions = {}
-): Promise<{ ok: true; data: T } | { ok: false; error: { code: string; message: string; fieldErrors?: Record<string, string[]> } }> {
-  const { method = 'GET', body, signal } = options;
+export class ApiError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    public readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
 
-  const headers: Record<string, string> = {
+async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const { method = 'GET', body, headers = {} } = options;
+
+  const requestHeaders: Record<string, string> = {
     'Content-Type': 'application/json',
+    ...headers,
   };
 
-  if (_memoryToken) {
-    headers['Authorization'] = `Bearer ${_memoryToken}`;
+  // Include CSRF token on all state-changing requests
+  const mutating = ['POST', 'PUT', 'DELETE', 'PATCH'];
+  if (mutating.includes(method) && csrfToken) {
+    requestHeaders['X-CSRF-Token'] = csrfToken;
   }
 
-  try {
-    const response = await fetch(`${BASE_URL}${path}`, {
-      method,
-      headers,
-      credentials: 'include', // send httpOnly cookie
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal,
-    });
+  const response = await fetch(`/api${path}`, {
+    method,
+    headers: requestHeaders,
+    body: body != null ? JSON.stringify(body) : undefined,
+    credentials: 'same-origin', // Include httpOnly cookies
+  });
 
-    // Parse JSON safely — handle non-JSON responses
-    let json: unknown;
-    try {
-      json = await response.json();
-    } catch {
-      return { ok: false, error: { code: 'PARSE_ERROR', message: 'Server returned an invalid response' } };
-    }
-
-    // Validate response shape — never trust server shape blindly
-    if (typeof json !== 'object' || json === null || !('ok' in json)) {
-      return { ok: false, error: { code: 'INVALID_RESPONSE', message: 'Unexpected response format' } };
-    }
-
-    return json as { ok: true; data: T } | { ok: false; error: { code: string; message: string; fieldErrors?: Record<string, string[]> } };
-  } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      return { ok: false, error: { code: 'ABORTED', message: 'Request was cancelled' } };
-    }
-    // Network error — safe message only, no internal details
-    return { ok: false, error: { code: 'NETWORK_ERROR', message: 'Network error. Check your connection.' } };
+  if (response.status === 204) {
+    return undefined as unknown as T;
   }
+
+  const data = await response.json().catch(() => ({ message: 'Network error', code: 'NETWORK_ERROR' }));
+
+  if (!response.ok) {
+    throw new ApiError(response.status, data.code ?? 'UNKNOWN', data.message ?? 'An error occurred');
+  }
+
+  return data as T;
 }
+
+export const api = {
+  get: <T>(path: string, headers?: Record<string, string>) =>
+    request<T>(path, { method: 'GET', headers }),
+  post: <T>(path: string, body?: unknown) =>
+    request<T>(path, { method: 'POST', body }),
+  put: <T>(path: string, body?: unknown) =>
+    request<T>(path, { method: 'PUT', body }),
+  delete: <T>(path: string) =>
+    request<T>(path, { method: 'DELETE' }),
+};

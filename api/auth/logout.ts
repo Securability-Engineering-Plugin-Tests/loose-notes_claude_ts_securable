@@ -1,22 +1,30 @@
+/**
+ * POST /api/auth/logout
+ *
+ * Clears the session and CSRF cookies. Requires CSRF validation.
+ */
+
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { handleCors, applySecurityHeaders } from '../_lib/cors.js';
-import { requireAuth, clearAuthCookie } from '../_lib/auth.js';
-import { audit } from '../_lib/audit.js';
+import { requireAuth, clearSession, requireCsrf } from '../_lib/auth.js';
+import { logger } from '../_lib/logger.js';
 
-export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
-  if (handleCors(req, res)) return;
-  applySecurityHeaders(res);
-
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
-    res.status(405).json({ ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'POST required' } });
-    return;
+    return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'POST required' });
   }
 
-  const ctx = await requireAuth(req, res);
-  if (!ctx) return;
+  if (!requireCsrf(req, res)) return;
 
-  clearAuthCookie(res);
-  audit({ userId: ctx.userId, username: ctx.username, action: 'user.logout', resourceType: 'user', resourceId: ctx.userId, outcome: 'success', req });
+  const claims = await requireAuth(req, res);
+  if (!claims) return;
 
-  res.status(200).json({ ok: true, data: { message: 'Logged out successfully' } });
+  clearSession(res);
+
+  logger.audit('auth.logout', {
+    action: 'logout',
+    userId: claims.sub,
+    outcome: 'success',
+  });
+
+  return res.status(200).json({ message: 'Logged out successfully' });
 }

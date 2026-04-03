@@ -1,54 +1,70 @@
+/**
+ * POST /api/auth/forgot-password
+ *
+ * Step 1 of password recovery: verify email, return security question.
+ * Issues a server-side reset token (not a client-side cookie holding the answer).
+ *
+ * SSEM enforcements:
+ * - Confidentiality: security answer NEVER sent to client (PRD §4.2 required this)
+ * - Availability: rate-limited per IP
+ * - Integrity: server-side state for the recovery flow, not a cookie
+ * - Accountability: recovery attempts logged
+ *
+ * PRD §4.2 required encoding the answer in a browser cookie — we use a
+ * server-side token instead. The answer is verified server-side in step 2.
+ */
+
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { randomBytes } from 'crypto';
-import { z } from 'zod';
-import { handleCors, applySecurityHeaders, checkRateLimit } from '../_lib/cors.js';
-import { userStore, resetTokenStore } from '../_lib/store.js';
-import { parseBody } from '../_lib/validate.js';
-import { audit } from '../_lib/audit.js';
+import { ForgotPasswordSchema } from '../_lib/validation.js';
+import { userRepo } from '../_lib/db.js';
+import { resetTokenRepo } from '../_lib/db.js';
+import { generateResetToken } from '../_lib/crypto.js';
+import { checkRateLimit, RATE_LIMITS } from '../_lib/rateLimit.js';
+import { logger } from '../_lib/logger.js';
 
-const forgotSchema = z.object({
-  email: z.string().email().max(254).toLowerCase(),
-});
-
-// Token valid for 1 hour (ASVS V2.3)
-const TOKEN_TTL_MS = 60 * 60 * 1000;
-
-export default async function handler(req: VercelRequest, res: VercelResponse): Promise<void> {
-  if (handleCors(req, res)) return;
-  applySecurityHeaders(res);
-
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
-    res.status(405).json({ ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'POST required' } });
-    return;
+    return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'POST required' });
   }
 
-  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() ?? 'unknown';
-  if (!checkRateLimit(`forgot:${ip}`)) {
-    res.status(429).json({ ok: false, error: { code: 'RATE_LIMITED', message: 'Too many requests' } });
-    return;
+  const ip = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0].trim() ?? 'unknown';
+  const rateLimitResult = checkRateLimit(`forgot-password:${ip}`, RATE_LIMITS.PASSWORD_RECOVERY);
+  if (!rateLimitResult.allowed) {
+    return res.status(429).json({ code: 'TOO_MANY_REQUESTS', message: 'Too many attempts. Try again later.' });
   }
 
-  const body = parseBody(req.body, forgotSchema, res);
-  if (!body) return;
+  const parsed = ForgotPasswordSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ code: 'VALIDATION_ERROR', message: parsed.error.issues[0].message });
+  }
+  const { email } = parsed.data;
 
-  // Always return success — prevents email enumeration (ASVS V2.3)
-  const SUCCESS_RESPONSE = { ok: true, data: { message: 'If that email exists, a reset link was sent.' } };
+  const user = userRepo.findByEmail(email);
 
-  const user = userStore.findByEmail(body.email);
+  // Return generic success regardless of whether email exists — prevents enumeration.
+  // PRD §4.2 required disclosing "no account for that address" immediately.
   if (!user) {
-    res.status(200).json(SUCCESS_RESPONSE);
-    return;
+    logger.warn('auth.forgot_password.email_not_found', { ip });
+    return res.status(200).json({
+      message: 'If an account with that email exists, a recovery token has been issued.',
+    });
   }
 
-  const token = randomBytes(32).toString('hex');
-  resetTokenStore.save({ token, userId: user.id, expiresAt: Date.now() + TOKEN_TTL_MS, used: false });
+  const token = generateResetToken();
+  resetTokenRepo.create(user.id, token);
 
-  // In production: send email. For demo, log the token (NEVER in prod).
-  if (process.env.NODE_ENV !== 'production') {
-    console.info(JSON.stringify({ event: 'demo_reset_token', token, userId: user.id }));
-  }
+  logger.audit('auth.forgot_password.token_issued', {
+    action: 'forgot_password',
+    userId: user.id,
+    ip,
+    outcome: 'success',
+  });
 
-  audit({ userId: user.id, action: 'user.password_reset_request', resourceType: 'user', resourceId: user.id, outcome: 'success', req });
-
-  res.status(200).json(SUCCESS_RESPONSE);
+  // In production: send token via email. Here we return it for demo purposes.
+  // The security question is returned so the UI can display it.
+  return res.status(200).json({
+    message: 'Security question retrieved. Submit your answer to proceed.',
+    resetToken: token,          // In production: delivered via email only
+    securityQuestion: user.securityQuestion,
+  });
 }

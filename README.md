@@ -1,232 +1,177 @@
-# Loose Notes
+# LooseNotes — Information Exchange Platform
 
-A full-stack multi-user note-taking web application built with TypeScript, React, Vite, Tailwind CSS, and Recharts. Deployed on Vercel using serverless API routes.
+A full-stack TypeScript + React + Vite + Tailwind + Recharts web application for creating, managing, sharing, and rating text notes. Engineered with FIASSE/SSEM securable-coding principles throughout.
 
-## Features
+---
 
-- **Authentication** — Register, login, logout, password reset via time-limited tokens
-- **Notes** — Create, edit, delete notes with public/private visibility
-- **Search** — Full-text search across public notes and your own private notes
-- **Ratings** — Rate notes 1–5 stars with optional comments
-- **Sharing** — Generate unique share links for notes (no auth required to view)
-- **Top Rated** — Browse highest-rated public notes (minimum 3 ratings)
-- **Admin Dashboard** — User management, activity audit log, Recharts analytics
-- **Profile** — Update username, email, and password
+## Stack
 
-## Tech Stack
+| Layer | Technology |
+|-------|-----------|
+| Frontend | React 18, TypeScript, Vite, Tailwind CSS, Recharts |
+| Backend | Vercel Serverless Functions (Node.js, TypeScript) |
+| Auth | JWT (`jose`), bcrypt (`bcryptjs`), httpOnly cookies |
+| Validation | Zod (trust-boundary schemas) |
+| HTML Sanitization | DOMPurify |
+| ZIP Handling | JSZip |
 
-| Layer | Technologies |
-|---|---|
-| Frontend | React 18, TypeScript 5, Vite 5, Tailwind CSS 3, Recharts 2, Zustand 4, React Router 6 |
-| Backend | Vercel serverless functions (Node.js), TypeScript |
-| Auth | JWT via `jose`, httpOnly cookies |
-| Validation | Zod (shared client + server) |
-| Passwords | bcryptjs (cost factor 12) |
+---
 
-## Setup & Running
+## Setup & Run
 
 ### Prerequisites
 
 - Node.js 18+
-- npm or pnpm
+- npm 9+
+- [Vercel CLI](https://vercel.com/cli) (`npm i -g vercel`)
 
-### Local Development
+### 1. Install dependencies
 
 ```bash
-# 1. Install dependencies
 npm install
-
-# 2. Copy environment template
-cp .env.example .env.local
-
-# 3. Edit .env.local — set a strong JWT_SECRET (32+ chars)
-
-# 4. Start Vite dev server (frontend only)
-npm run dev
-# App runs at http://localhost:5173
-
-# 5. For full-stack local dev with API routes, use Vercel CLI:
-npm install -g vercel
-vercel dev
-# App runs at http://localhost:3000
 ```
 
-### Build & Deploy
+### 2. Configure environment
 
 ```bash
-# Build production frontend bundle
-npm run build
-
-# Deploy to Vercel
-vercel deploy
+cp .env.example .env.local
 ```
 
-### Environment Variables
+Edit `.env.local` and set:
 
-| Variable | Required | Description |
-|---|---|---|
-| `JWT_SECRET` | Yes | JWT signing secret — minimum 32 random chars |
-| `JWT_EXPIRES_IN` | No | Token lifetime, default `7d` |
-| `PASSWORD_RESET_EXPIRES` | No | Reset token TTL in seconds, default `3600` |
-| `ALLOWED_ORIGINS` | No | Comma-separated CORS origins |
-| `NODE_ENV` | No | `production` enables Secure cookie flag |
+| Variable | Description |
+|----------|-------------|
+| `JWT_SECRET` | At least 64-char random string: `openssl rand -base64 64` |
+| `CSRF_SECRET` | At least 32-char random string: `openssl rand -base64 32` |
+| `APP_BASE_URL` | Base URL (e.g. `http://localhost:3000`) |
+| `SEED_ADMIN_EMAIL` | Initial admin account email |
+| `SEED_ADMIN_PASSWORD` | Initial admin account password (min 12 chars, meets policy) |
+| `ATTACHMENTS_DIR` | Absolute path to attachment storage directory |
 
-### Demo Credentials
+### 3. Run locally
 
-The app is seeded with demo data on startup:
+```bash
+vercel dev
+```
 
-| Username | Password | Role |
-|---|---|---|
-| `admin` | `Admin123!` | Admin |
-| `alice` | `Alice123!` | User |
-| `bob` | `Bob12345!` | User |
+This starts both the Vite dev server (frontend) and the Vercel serverless API routes.
 
-> **Note**: The in-memory store resets on each serverless function cold start. For production, replace `api/_lib/store.ts` with a real database (Vercel Postgres, PlanetScale, Supabase, etc.).
+### 4. Build for production
 
----
+```bash
+npm run build
+```
 
-## SSEM Attribute Coverage Summary
+### 5. Deploy to Vercel
 
-The nine SSEM attributes are organized across three pillars. Here's how each is addressed:
+```bash
+vercel --prod
+```
 
-### Maintainability Pillar
-
-#### Analyzability
-Code is structured for low cognitive overhead:
-- All functions are ≤ 30 LoC with cyclomatic complexity < 10
-- Single-responsibility components and services — each file does one thing
-- API route handlers are thin: validate → authorize → call store → respond
-- Trust boundaries are explicitly commented (`// Trust boundary: validate at entry`)
-- `api/notes/_noteHelpers.ts` centralizes note-to-response mapping to eliminate duplication
-- Discriminated union types (`ApiResponse<T>`, `AuditAction`) make data flow self-documenting
-
-#### Modifiability
-The data layer is cleanly separated from business logic:
-- `api/_lib/store.ts` is the sole data access module — swap it for a real DB without touching route logic
-- Validation schemas in `src/utils/validation.ts` and `api/_lib/validate.ts` are centralized, not scattered
-- Security controls (JWT, rate limiting, CORS) live in dedicated `api/_lib/` modules
-- Frontend services (`src/services/`) decouple React components from API implementation details
-- Configuration is externalized to environment variables (JWT secret, allowed origins, TTLs)
-
-#### Testability
-Every layer is injectable and testable in isolation:
-- `useApi(asyncFn)` hook accepts any async function — mock services without touching components
-- `useFormValidation(schema)` is a pure hook — pass any Zod schema, test independently
-- API route handlers receive `VercelRequest`/`VercelResponse` — easily stubbed in unit tests
-- Store operations (`userStore`, `noteStore`, etc.) are plain functions on exported objects
-- `audit()` in `api/_lib/audit.ts` is non-throwing and mockable
-
----
-
-### Trustworthiness Pillar
-
-#### Confidentiality
-Sensitive data is classified and protected at every layer:
-- `passwordHash` field lives only in `UserRecord` (server-side only) — the `User` type exported to the client never includes it
-- JWT secrets come from environment variables only — never hardcoded
-- Logs use structured JSON and explicitly avoid logging passwords, tokens, or PII (`logger.ts` comment: "CRITICAL: Never log passwords, tokens, or PII")
-- httpOnly cookies prevent JavaScript access to auth tokens (XSS mitigation)
-- Error responses return generic messages for auth failures to prevent enumeration
-- Data minimization: API responses include only the fields the caller needs
-
-#### Accountability
-Every security-sensitive action produces an audit trail:
-- `api/_lib/audit.ts` records: who (`userId`, `username`), what (`AuditAction`), when (`timestamp`), where (`ipAddress`), and outcome (`success`/`failure`)
-- All auth events are logged: `user.register`, `user.login`, `user.login_failed`, `user.logout`, `user.password_reset_*`
-- All admin actions are logged: `admin.view_users`, `admin.reassign_note`
-- Authorization failures are logged with `outcome: 'failure'`
-- Audit log is append-only (entries are never modified)
-- Admin dashboard surfaces the last 20 audit events via Recharts + table
-
-#### Authenticity
-Authentication uses established mechanisms with proper validation:
-- Passwords hashed with bcrypt at cost factor 12 (ASVS V2.4 compliant)
-- JWT tokens signed with HS256 via `jose` (standards-compliant RFC 7519)
-- Token verification in `verifyToken()` returns `null` on any failure — no detail leaked to caller
-- Timing-safe bcrypt comparison runs even when user doesn't exist (prevents username enumeration)
-- JWT extracted from both `Authorization: Bearer` header and httpOnly cookie — dual-channel resilience
-- `requireAuth()` and `requireAdmin()` centralize all auth checks — no ad-hoc checks scattered in routes
-- Password reset tokens are 256-bit random values (32 bytes hex), expire after 1 hour, invalidated on use
-
----
-
-### Reliability Pillar
-
-#### Availability
-Resource limits and circuit-breakers prevent DoS conditions:
-- In-memory rate limiter in `api/_lib/cors.ts` limits auth endpoints to 10 requests per 15-minute window per IP
-- Audit log capped at 1000 in-memory entries to prevent unbounded growth
-- Request body size validated by Zod schemas (title ≤ 200, content ≤ 50,000, comment ≤ 1000 chars)
-- Password max length 128 chars prevents bcrypt DoS via oversized inputs
-- Search query sanitized and capped at 200 chars before processing
-- Frontend `useApi` hook cancels requests when components unmount (prevents memory leaks)
-- AbortSignal support in `apiRequest()` for request cancellation
-
-#### Integrity
-Input is validated at every trust boundary using the canonicalize → sanitize → validate pattern:
-- `src/utils/sanitize.ts` implements `canonicalize()` (NFC normalization + trim) → `sanitizeText()` (HTML escape) → validation via Zod
-- `api/_lib/validate.ts` applies Zod schemas server-side at each route entry point
-- All Vercel route handlers call `parseBody()` before touching `req.body` — no raw input ever processed directly
-- URL parameters extracted with explicit type checks: `typeof req.query.id === 'string' ? req.query.id : null`
-- **Derived Integrity Principle**: server-owned state (ownerId, role, createdAt) is never accepted from client input — derived server-side only
-- **Request Surface Minimization**: route handlers extract only the fields defined in their Zod schema
-- Output is always plain text rendered via React's default text escaping — no `dangerouslySetInnerHTML`
-- SQL injection is N/A (no SQL) but parameterized-equivalent pattern applied: no string concatenation in queries
-
-#### Resilience
-The codebase is defensively structured against unexpected conditions:
-- Specific error handling everywhere — `ApiError` class in services, typed `ZodError` in validators
-- `audit()` is wrapped in try/catch — audit failure never blocks the business operation
-- `verifyToken()` catches all JWT exceptions and returns `null` — callers don't need to know why it failed
-- `useApi` hook catches all async errors and surfaces them as user-friendly strings
-- Frontend components handle `null`/`undefined` data via loading states and empty states
-- `onRehydrateStorage` in Zustand safely handles missing/corrupt persisted auth state
-- `createRoot()` in `main.tsx` throws a clear error if the DOM root element is missing
-- Cascade deletes on note deletion: ratings, attachments, and share links cleaned up atomically
+Set all environment variables in the Vercel dashboard (Project → Settings → Environment Variables). **Never commit `.env.local` to version control.**
 
 ---
 
 ## Project Structure
 
 ```
-.
-├── api/                        # Vercel serverless API routes
-│   ├── _lib/                   # Shared API utilities
-│   │   ├── audit.ts            # Structured audit logging
-│   │   ├── auth.ts             # JWT helpers, cookie management
-│   │   ├── cors.ts             # CORS, security headers, rate limiter
-│   │   ├── store.ts            # In-memory data store (replace for production)
-│   │   ├── types.ts            # Server-only types (UserRecord with passwordHash)
-│   │   └── validate.ts         # Zod-based request body validation
-│   ├── auth/                   # Auth endpoints
-│   ├── notes/                  # Notes CRUD + search + top-rated + sharing
-│   ├── ratings/                # Note rating endpoint
-│   ├── share/                  # Public share link endpoint
-│   ├── admin/                  # Admin dashboard, users, reassign
-│   └── profile.ts              # User profile GET/PUT
-├── src/
-│   ├── types/index.ts          # All domain + API types
-│   ├── utils/                  # cn, logger, sanitize, validation schemas
-│   ├── services/               # API client wrappers (authService, notesService, etc.)
-│   ├── store/                  # Zustand stores (authStore, toastStore)
-│   ├── hooks/                  # useAuth, useApi, useFormValidation
-│   ├── components/
-│   │   ├── layout/             # Layout, Navbar, ProtectedRoute
-│   │   ├── ui/                 # Button, Input, Modal, Alert, StarRating, Toast, etc.
-│   │   ├── notes/              # NoteCard, NoteForm, RatingForm
-│   │   └── charts/             # Recharts wrappers (NotesByDayChart, RatingDistributionChart)
-│   ├── pages/                  # Route-level page components
-│   └── router/index.tsx        # React Router route tree
-├── vercel.json                 # Routing + security headers
-├── vite.config.ts
-├── tailwind.config.js
-└── tsconfig.json
+├── src/                    # React frontend
+│   ├── components/         # Shared + feature components
+│   ├── context/            # Auth context
+│   ├── pages/              # Route-level page components
+│   ├── services/           # API client layer
+│   ├── types/              # Shared TypeScript types
+│   └── utils/              # sanitization, etc.
+├── api/                    # Vercel serverless API routes
+│   ├── _lib/               # Shared server utilities
+│   │   ├── auth.ts         # JWT session management
+│   │   ├── crypto.ts       # bcrypt, secure tokens
+│   │   ├── db.ts           # In-memory repository layer
+│   │   ├── logger.ts       # Structured audit logging
+│   │   ├── rateLimit.ts    # In-process rate limiter
+│   │   └── validation.ts   # Zod schemas
+│   ├── auth/               # Login, register, logout, password recovery
+│   ├── notes/              # CRUD, search, share
+│   ├── ratings/            # Rating submission and retrieval
+│   ├── attachments/        # Upload and download
+│   ├── admin/              # Admin dashboard
+│   ├── profile/            # Profile management
+│   ├── export.ts           # ZIP export
+│   ├── import.ts           # ZIP import
+│   ├── top-rated.ts        # Top-rated notes
+│   ├── diagnostics.ts      # Request diagnostics
+│   └── email-autocomplete.ts
+├── vercel.json             # Security headers + routing
+└── .env.example            # Environment variable template
 ```
 
-## Security Notes
+---
 
-- **Production data**: Replace `api/_lib/store.ts` with a real database. The in-memory store is for demonstration only.
-- **JWT secret**: Set `JWT_SECRET` to a cryptographically random value of at least 32 characters.
-- **Email**: Implement a real email provider in `api/auth/forgot-password.ts` (replace the console.info dev log).
-- **File uploads**: The attachment API (`api/attachments/`) validates MIME type and size but stores metadata only. Integrate with Vercel Blob, S3, or similar for actual file storage.
-- **HTTPS**: Vercel enforces HTTPS in production — the `Secure` cookie flag is set automatically when `NODE_ENV=production`.
+## SSEM Attribute Coverage Summary
+
+The nine SSEM attributes are addressed across the codebase as follows:
+
+### Maintainability
+
+#### Analyzability
+All API route handlers are single-purpose and stay within ~60 LoC. Repository methods (`api/_lib/db.ts`) are named for their intent (e.g. `findByUsername`, `searchByEmailPrefix`). Security-sensitive sections (trust boundary crossings, path validation, token generation) carry inline comments explaining *why* the pattern is used. The structured logger (`api/_lib/logger.ts`) produces machine-readable JSON events that can be queried for operational insight.
+
+#### Modifiability
+Security logic is centralized in dedicated modules (`auth.ts`, `crypto.ts`, `rateLimit.ts`, `validation.ts`) rather than scattered across route handlers. The data access layer (`db.ts`) implements a repository pattern with a clean interface, making it straightforward to swap the in-memory store for a real database (Postgres + Prisma, etc.) without modifying any route logic. Secrets and configuration are externalized via environment variables — no literals in code.
+
+#### Testability
+Every API route handler accepts `VercelRequest`/`VercelResponse` objects that can be provided as mocks in unit tests. Auth, crypto, validation, and rate-limit modules are independently importable and injectable. The frontend's `AuthContext` uses dependency-injected service calls, allowing services to be swapped for test doubles.
+
+---
+
+### Trustworthiness
+
+#### Confidentiality
+Passwords are hashed with bcrypt (cost factor 12) — never stored as base64 or plaintext (PRD §2.2, §16.2 required base64). Security question answers are hashed with bcrypt — never stored or transmitted in recoverable form (PRD §4.2 required encoding them in browser cookies). The `DbUser` internal type carries `passwordHash` and `securityAnswerHash`; the public `User` type omits both. Session JWTs are issued in `httpOnly; Secure; SameSite=Strict` cookies — inaccessible to JavaScript (PRD §2.2 required no flags). Sensitive headers (`Cookie`, `Authorization`) are redacted in the diagnostics endpoint (PRD §25.2 required raw reflection).
+
+#### Accountability
+All authentication events (login success/failure, register, logout, password reset), authorization failures (ownership checks, admin access), and data mutations (note CRUD, profile updates, admin reassignments) are written to a structured audit log via `logger.audit()`. Log entries include `userId`, `action`, `resource`, `outcome`, and `timestamp`. User input is sanitized before logging to prevent log injection (PRD §18.2 required logging raw unsanitised values).
+
+#### Authenticity
+Sessions are signed JWTs verified on every request using `jose`'s `jwtVerify` with a server-side secret (`JWT_SECRET`). User identity inside API routes is always derived from the verified JWT claims — never from a client-supplied cookie value (PRD §16.2 required the opposite). The double-submit CSRF pattern (`X-CSRF-Token` header vs. `csrf` cookie) protects all state-changing requests (PRD §8.2, §9.2 required no CSRF protection). Share tokens are 24 bytes of `crypto.randomBytes` — cryptographically unpredictable (PRD §10.2 required sequential integers).
+
+---
+
+### Reliability
+
+#### Availability
+Authentication endpoints (`/api/auth/login`, `/api/auth/register`, password-recovery) are rate-limited per IP using `api/_lib/rateLimit.ts` (PRD §2.2, §4.3 explicitly required no rate limiting). The autocomplete endpoint is also rate-limited. Results are paginated throughout to bound response sizes. Resource limits (max file size 10 MB, max ZIP 50 MB, max note content 50 KB) prevent resource exhaustion. Request timeouts are expected to be configured at the Vercel infrastructure level.
+
+#### Integrity
+Input is validated at every trust boundary using Zod schemas (`api/_lib/validation.ts`) following the canonicalize → sanitize → validate pattern (FIASSE S6.4.1). The **Derived Integrity Principle** is applied throughout: `ownerId` is always derived from the JWT (`claims.sub`), never accepted from the client body (PRD §8.2, §9.2, §13.2 all required the opposite). Search keywords and rating fields are passed to typed filter predicates — not concatenated into query strings (PRD §12.2, §13.2, §15.2, §17.2 required raw concatenation). The tag filter in `/api/top-rated` uses a Zod enum allowlist (PRD §17.2 required direct concatenation). Note content is sanitized with DOMPurify (allowlist-based) before `dangerouslySetInnerHTML` on the frontend; all other data renders through React JSX, which HTML-escapes by default (PRD §6.2 required no encoding).
+
+#### Resilience
+All API routes use specific exception handling with meaningful error responses (no bare `catch` that silently swallows errors). Path traversal is prevented in attachment download (`api/attachments/download.ts`) and ZIP import (`api/import.ts`) using `isWithinBase()` jail validation — even when filenames are server-assigned UUIDs, the final path is still validated (PRD §20.2, §21.2, §23.2 required no path validation). ZIP Slip is prevented in `api/import.ts` by stripping path components from entry names with `basename()` and validating against an extension allowlist. XML XXE risk is absent — no XML parser is used; the PRD requirement for XML processing with external entity resolution is replaced with structured JSON manifests. The `ErrorBoundary` React component prevents unhandled render errors from crashing the application and avoids leaking stack traces to users.
+
+---
+
+## PRD Security Anti-Patterns Corrected
+
+| PRD Section | Anti-Pattern | Securable Implementation |
+|-------------|-------------|--------------------------|
+| §2.2 | Base64 password "encoding" | bcrypt hash (cost 12) |
+| §2.2 | No rate limiting on login | Rate-limited 10/15min per IP |
+| §2.2 | Cookie without HttpOnly/Secure/SameSite | httpOnly + Secure + SameSite=Strict |
+| §4.2 | Security answer in browser cookie (base64) | Server-side reset token; answer verified against hash |
+| §4.3 | Current password returned in plaintext | Password is never returned; user sets new one |
+| §6.2 | Note content/comments rendered without encoding | JSX escaping + DOMPurify for HTML content |
+| §7.2 | Client filename for file I/O; no MIME check | Server-assigned UUID filename; MIME + extension allowlist |
+| §8.2, §9.2 | No server-side ownership check on edit/delete | Ownership enforced from JWT `sub` on every mutation |
+| §8.2, §9.2 | No CSRF protection | Double-submit CSRF pattern on all state-changing requests |
+| §10.2 | Sequential integer share tokens | 24-byte `crypto.randomBytes` tokens |
+| §12.2 | Search via string concatenation | Typed filter predicate on in-memory collection |
+| §13.2 | Rating insert via string concatenation | Typed repository create with derived userId |
+| §15.2 | Unauthenticated email autocomplete; concatenation | Requires auth; parameterised prefix lookup |
+| §16.2 | Profile lookup by cookie value; no password policy | JWT-derived identity; 12-char policy enforced |
+| §17.2 | Tag filter concatenated into query | Zod enum allowlist |
+| §18.2 | OS command execution interface | Not implemented — cannot be made securable |
+| §20.2, §23.2 | Path traversal in download / export | `isWithinBase()` jail validation |
+| §21.2 | ZIP Slip in import | `basename()` + extension allowlist |
+| §22.2 | XXE via default XML parser config | No XML parser used; JSON manifest only |
+| §24.2 | Hardcoded passphrase + static PBKDF2 salt | Env var secret; per-operation random salt |
+| §25.2 | Raw header values in page output (XSS) | HTML-encoded server-side; JSX text nodes on frontend |
