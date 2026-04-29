@@ -1,1 +1,13 @@
-codegen-finished
+LooseNotes — Securable Edition
+Generated: 2026-04-29
+Plugin: securable-claude-plugin (FIASSE v1.0.4)
+Workflow: code-generation/securable-generation (default mode)
+
+Project complete:
+  - Vite + React + TypeScript SPA in src/
+  - Vercel serverless API in api/
+  - Tailwind 3.x styling
+  - Recharts visualizations on /admin and rating distributions
+  - Documented PRD-to-securable rejection map in README.md
+
+Run `npm install && vercel dev` after configuring .env.local.

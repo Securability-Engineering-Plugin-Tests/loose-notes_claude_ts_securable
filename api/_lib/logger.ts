@@ -1,59 +1,88 @@
 /**
- * Structured logger for API routes.
+ * Structured logger with secret redaction.
  *
- * SSEM: Accountability — all security-sensitive events are logged with
- * structured data (who, what, where, when). No PII or secrets in log output.
- *
- * FIASSE S3.3.1 Transparency: meaningful event names, context fields.
+ * FIASSE: code-level instrumentation built in, not bolted on (S3.2.1.4
+ * Observability). Emits one JSON object per line with a stable schema so
+ * downstream tooling can parse without regexes. Sensitive fields are stripped
+ * at the boundary (S3.2.2.1 Confidentiality) — we never log raw bodies, raw
+ * cookie strings, Authorization headers, or password fields.
  */
 
-type LogLevel = 'info' | 'warn' | 'error' | 'audit';
+import { config } from './config.js';
 
-interface LogEntry {
-  level: LogLevel;
-  event: string;
-  timestamp: string;
-  [key: string]: unknown;
+type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+const LEVEL_PRIORITY: Record<LogLevel, number> = {
+  debug: 10,
+  info: 20,
+  warn: 30,
+  error: 40,
+};
+
+const REDACTED_KEYS = new Set([
+  'password',
+  'newpassword',
+  'currentpassword',
+  'token',
+  'sessiontoken',
+  'cookie',
+  'authorization',
+  'set-cookie',
+  'reset_token',
+  'share_token',
+  'answer',
+  'security_answer',
+  'apikey',
+  'api_key',
+]);
+
+function shouldEmit(level: LogLevel): boolean {
+  const configured = LEVEL_PRIORITY[(config.logLevel as LogLevel)] ?? LEVEL_PRIORITY.info;
+  return LEVEL_PRIORITY[level] >= configured;
 }
 
-/**
- * Sanitize a value before logging to prevent log injection.
- * Removes newlines and limits length.
- */
-function sanitizeLogValue(value: unknown): unknown {
+function redact(value: unknown, depth = 0): unknown {
+  if (depth > 4) return '[truncated]';
+  if (value === null || value === undefined) return value;
   if (typeof value === 'string') {
-    return value.replace(/[\r\n\t]/g, '_').slice(0, 200);
+    return value.length > 512 ? `${value.slice(0, 509)}...` : value;
   }
-  return value;
+  if (typeof value !== 'object') return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, 50).map((v) => redact(v, depth + 1));
+  }
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (REDACTED_KEYS.has(k.toLowerCase())) {
+      out[k] = '[redacted]';
+    } else {
+      out[k] = redact(v, depth + 1);
+    }
+  }
+  return out;
 }
 
-function sanitizeContext(ctx: Record<string, unknown>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(ctx)) {
-    result[key] = sanitizeLogValue(value);
-  }
-  return result;
-}
-
-function emit(level: LogLevel, event: string, context: Record<string, unknown> = {}): void {
-  const entry: LogEntry = {
+function emit(level: LogLevel, event: string, fields: Record<string, unknown>): void {
+  if (!shouldEmit(level)) return;
+  const payload = {
+    ts: new Date().toISOString(),
     level,
     event,
-    timestamp: new Date().toISOString(),
-    ...sanitizeContext(context),
+    ...redact(fields) as Record<string, unknown>,
   };
-  // In production replace with a structured log transport (e.g. Datadog, Splunk)
-  console.log(JSON.stringify(entry));
+  const line = JSON.stringify(payload);
+  if (level === 'error' || level === 'warn') {
+    console.error(line);
+  } else {
+    console.log(line);
+  }
 }
 
 export const logger = {
-  info: (event: string, ctx?: Record<string, unknown>) => emit('info', event, ctx),
-  warn: (event: string, ctx?: Record<string, unknown>) => emit('warn', event, ctx),
-  error: (event: string, ctx?: Record<string, unknown>) => emit('error', event, ctx),
-  /**
-   * Audit log — immutable record of security-sensitive actions.
-   * Always include: userId, action, resource, outcome.
-   */
-  audit: (event: string, ctx: { userId?: string; action: string; resource?: string; outcome: 'success' | 'failure'; [k: string]: unknown }) =>
-    emit('audit', event, ctx),
+  debug: (event: string, fields: Record<string, unknown> = {}) => emit('debug', event, fields),
+  info: (event: string, fields: Record<string, unknown> = {}) => emit('info', event, fields),
+  warn: (event: string, fields: Record<string, unknown> = {}) => emit('warn', event, fields),
+  error: (event: string, fields: Record<string, unknown> = {}) => emit('error', event, fields),
 };
+
+export type Logger = typeof logger;

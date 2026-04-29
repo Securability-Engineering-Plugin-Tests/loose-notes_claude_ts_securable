@@ -1,96 +1,63 @@
 /**
- * POST /api/notes/share       — Generate a share link for a note (owner only)
- * GET  /api/notes/share/:token — Retrieve a shared note without authentication
+ * POST /api/notes/share — generate a share token for a note the caller owns.
+ * Body: { noteId, ttlMinutes }
  *
- * SSEM enforcements:
- * - Integrity: share token uses crypto.randomBytes (PRD §10.2 required sequential int)
- * - Authenticity: generation requires ownership verification
- * - Confidentiality: private note content only exposed via valid token
+ * FIASSE rejection from PRD §10.2:
+ *  - "Token generation shall use an integer-based or sequential algorithm; no
+ *    cryptographically secure RNG is required". REJECTED. Tokens are 256-bit
+ *    random values from node:crypto. (S3.2.2.3 Authenticity, S3.2.3.2 Integrity)
+ *  - The share endpoint also stamps an explicit expiry, replacing the open-
+ *    ended access pattern in the PRD.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { requireAuth, requireCsrf } from '../_lib/auth.js';
-import { noteRepo, userRepo, ratingRepo, attachmentRepo } from '../_lib/db.js';
-import { generateShareToken } from '../_lib/crypto.js';
-import { logger } from '../_lib/logger.js';
+import { handler, readJsonBody, created } from '../_lib/request.js';
 import { z } from 'zod';
+import { ShareSchema, Uuid } from '../_lib/schemas.js';
+import {
+  findNoteForOwner, createShareToken, appendAudit,
+} from '../_lib/db.js';
+import { randomToken } from '../_lib/crypto.js';
+import { config } from '../_lib/config.js';
+import {
+  requireMethod, requireUser, enforceOrigin,
+} from '../_lib/auth.js';
+import { consume, limits } from '../_lib/ratelimit.js';
+import { AppError } from '../_lib/errors.js';
 
-const GenerateShareSchema = z.object({ noteId: z.string().uuid() });
+const ShareBody = ShareSchema.extend({ noteId: Uuid });
+type ShareBody = z.infer<typeof ShareBody>;
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  // Generate share link — requires authentication and ownership
-  if (req.method === 'POST') {
-    const claims = await requireAuth(req, res);
-    if (!claims) return;
-    if (!requireCsrf(req, res)) return;
+export default handler(async (req: VercelRequest, res: VercelResponse, { requestId }) => {
+  requireMethod(req, res, ['POST']);
+  enforceOrigin(req);
+  const user = await requireUser(req);
+  consume(`shareCreate:${user.id}`, limits.shareCreate);
 
-    const parsed = GenerateShareSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ code: 'VALIDATION_ERROR', message: parsed.error.issues[0].message });
-    }
+  const body: ShareBody = await readJsonBody(req, ShareBody);
+  const note = findNoteForOwner(body.noteId, { id: user.id, role: user.role });
+  if (!note) throw new AppError('not_found', 'Note not found');
 
-    const note = noteRepo.findById(parsed.data.noteId);
-    if (!note) {
-      return res.status(404).json({ code: 'NOT_FOUND', message: 'Note not found' });
-    }
-    if (note.ownerId !== claims.sub) {
-      return res.status(403).json({ code: 'FORBIDDEN', message: 'You do not own this note' });
-    }
+  const token = randomToken(config.limits.shareTokenBytes);
+  const ttlSeconds = body.ttlMinutes * 60;
+  const rec = createShareToken({
+    token,
+    noteId: note.id,
+    createdBy: user.id,
+    ttlSeconds,
+  });
 
-    // Cryptographically secure random token — not sequential
-    const token = generateShareToken();
-    noteRepo.update(note.id, { shareToken: token });
+  appendAudit({
+    actorId: user.id,
+    event: 'note.share.create',
+    outcome: 'allow',
+    context: { noteId: note.id, ttlMinutes: body.ttlMinutes, requestId },
+  });
 
-    const baseUrl = process.env.APP_BASE_URL ?? '';
-    logger.audit('note.share_link.created', {
-      action: 'create_share_link',
-      userId: claims.sub,
-      resource: note.id,
-      outcome: 'success',
-    });
-
-    return res.status(200).json({
-      url: `${baseUrl}/share/${token}`,
-      token,
-    });
-  }
-
-  // Retrieve shared note — public endpoint, no auth required
-  if (req.method === 'GET') {
-    const tokenResult = z.string().min(1).max(100).safeParse(req.query.token);
-    if (!tokenResult.success) {
-      return res.status(400).json({ code: 'INVALID_TOKEN', message: 'Invalid share token' });
-    }
-
-    const note = noteRepo.findByShareToken(tokenResult.data);
-    if (!note) {
-      return res.status(404).json({ code: 'NOT_FOUND', message: 'Shared note not found' });
-    }
-
-    const owner = userRepo.findById(note.ownerId);
-    const ratings = ratingRepo.findByNoteId(note.id);
-    const attachments = attachmentRepo.listByNote(note.id).map(a => ({
-      id: a.id,
-      filename: a.filename,
-      originalName: a.originalName,
-      contentType: a.contentType,
-      size: a.size,
-    }));
-    const avg = ratings.length
-      ? ratings.reduce((s, r) => s + r.score, 0) / ratings.length
-      : undefined;
-
-    return res.status(200).json({
-      id: note.id,
-      title: note.title,
-      content: note.content,
-      ownerUsername: owner?.username ?? 'unknown',
-      createdAt: note.createdAt,
-      attachments,
-      averageRating: avg,
-      ratingCount: ratings.length,
-    });
-  }
-
-  return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'GET or POST required' });
-}
+  created(res, {
+    token: rec.token,
+    expiresAt: rec.expiresAt,
+    // The path is the application route; we let the SPA build the absolute URL.
+    sharePath: `/shared/${rec.token}`,
+  }, requestId);
+});

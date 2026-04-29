@@ -1,30 +1,32 @@
 /**
- * POST /api/auth/logout
+ * POST /api/auth/logout — clear the session cookie.
  *
- * Clears the session and CSRF cookies. Requires CSRF validation.
+ * The session is a stateless signed JWT; "logout" means clearing the cookie
+ * client-side. For a true server-side revocation strategy with JWTs we'd add
+ * a token-id deny-list (kid + jti); current TTL is 1 hour, so the residual
+ * window is bounded. (S3.2.3.1 Availability vs. S3.2.2.3 trade-off)
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { requireAuth, clearSession, requireCsrf } from '../_lib/auth.js';
+import { handler, noContent } from '../_lib/request.js';
+import { requireMethod, enforceOrigin, getAuthenticatedUser } from '../_lib/auth.js';
+import { clearSession } from '../_lib/session.js';
+import { appendAudit } from '../_lib/db.js';
 import { logger } from '../_lib/logger.js';
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'POST required' });
-  }
-
-  if (!requireCsrf(req, res)) return;
-
-  const claims = await requireAuth(req, res);
-  if (!claims) return;
-
+export default handler(async (req: VercelRequest, res: VercelResponse, { requestId }) => {
+  requireMethod(req, res, ['POST']);
+  enforceOrigin(req);
+  const user = await getAuthenticatedUser(req);
   clearSession(res);
-
-  logger.audit('auth.logout', {
-    action: 'logout',
-    userId: claims.sub,
-    outcome: 'success',
-  });
-
-  return res.status(200).json({ message: 'Logged out successfully' });
-}
+  if (user) {
+    appendAudit({
+      actorId: user.id,
+      event: 'auth.logout',
+      outcome: 'info',
+      context: { requestId },
+    });
+    logger.info('auth.logout', { userId: user.id, requestId });
+  }
+  noContent(res, requestId);
+});

@@ -1,81 +1,54 @@
-import React from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { AuthProvider, useAuth } from './context/AuthContext';
-import ErrorBoundary from './components/shared/ErrorBoundary';
-import Layout from './components/shared/Layout';
-
-// Pages
+import type React from 'react';
+import { Navigate, Route, Routes } from 'react-router-dom';
+import Layout from './components/Layout';
+import ProtectedRoute from './components/ProtectedRoute';
+import { useAuth } from './lib/auth';
 import HomePage from './pages/HomePage';
 import LoginPage from './pages/LoginPage';
 import RegisterPage from './pages/RegisterPage';
 import NotesPage from './pages/NotesPage';
 import NoteDetailPage from './pages/NoteDetailPage';
-import CreateNotePage from './pages/CreateNotePage';
+import NewNotePage from './pages/NewNotePage';
 import EditNotePage from './pages/EditNotePage';
 import ProfilePage from './pages/ProfilePage';
-import PasswordRecoveryPage from './pages/PasswordRecoveryPage';
 import AdminPage from './pages/AdminPage';
-import TopRatedPage from './pages/TopRatedPage';
-import SharePage from './pages/SharePage';
-import SearchPage from './pages/SearchPage';
-import DiagnosticsPage from './pages/DiagnosticsPage';
+import SharedNotePage from './pages/SharedNotePage';
+import ResetPasswordPage from './pages/ResetPasswordPage';
+import NotFoundPage from './pages/NotFoundPage';
 
-/** Route guard: redirects to /login if not authenticated. */
-function RequireAuth({ children }: { children: React.ReactNode }) {
-  const { user, isLoading } = useAuth();
-  if (isLoading) return <div className="text-center text-gray-400 py-12">Loading…</div>;
-  if (!user) return <Navigate to="/login" replace />;
-  return <>{children}</>;
-}
-
-/** Route guard: redirects to /notes if not admin. */
-function RequireAdmin({ children }: { children: React.ReactNode }) {
-  const { user, isLoading } = useAuth();
-  if (isLoading) return <div className="text-center text-gray-400 py-12">Loading…</div>;
-  if (!user) return <Navigate to="/login" replace />;
-  if (user.role !== 'admin') return <Navigate to="/notes" replace />;
-  return <>{children}</>;
-}
-
-function AppRoutes() {
+export default function App(): React.ReactElement {
+  const { loading } = useAuth();
+  if (loading) {
+    return (
+      <div className="min-h-screen grid place-items-center text-slate-500">
+        Loading…
+      </div>
+    );
+  }
   return (
-    <Layout>
-      <Routes>
-        {/* Public routes */}
-        <Route path="/" element={<HomePage />} />
-        <Route path="/login" element={<LoginPage />} />
-        <Route path="/register" element={<RegisterPage />} />
-        <Route path="/forgot-password" element={<PasswordRecoveryPage />} />
-        <Route path="/top-rated" element={<TopRatedPage />} />
-        <Route path="/share/:token" element={<SharePage />} />
+    <Routes>
+      <Route element={<Layout />}>
+        <Route index element={<HomePage />} />
+        <Route path="login" element={<LoginPage />} />
+        <Route path="register" element={<RegisterPage />} />
+        <Route path="reset-password" element={<ResetPasswordPage />} />
+        <Route path="shared/:token" element={<SharedNotePage />} />
 
-        {/* Authenticated routes */}
-        <Route path="/notes" element={<RequireAuth><NotesPage /></RequireAuth>} />
-        <Route path="/notes/new" element={<RequireAuth><CreateNotePage /></RequireAuth>} />
-        <Route path="/notes/:id" element={<RequireAuth><NoteDetailPage /></RequireAuth>} />
-        <Route path="/notes/:id/edit" element={<RequireAuth><EditNotePage /></RequireAuth>} />
-        <Route path="/search" element={<RequireAuth><SearchPage /></RequireAuth>} />
-        <Route path="/profile" element={<RequireAuth><ProfilePage /></RequireAuth>} />
-        <Route path="/diagnostics" element={<RequireAuth><DiagnosticsPage /></RequireAuth>} />
+        <Route element={<ProtectedRoute />}>
+          <Route path="notes" element={<NotesPage />} />
+          <Route path="notes/new" element={<NewNotePage />} />
+          <Route path="notes/:id" element={<NoteDetailPage />} />
+          <Route path="notes/:id/edit" element={<EditNotePage />} />
+          <Route path="profile" element={<ProfilePage />} />
+        </Route>
 
-        {/* Admin routes */}
-        <Route path="/admin" element={<RequireAdmin><AdminPage /></RequireAdmin>} />
+        <Route element={<ProtectedRoute requireAdmin />}>
+          <Route path="admin" element={<AdminPage />} />
+        </Route>
 
-        {/* Fallback */}
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </Layout>
-  );
-}
-
-export default function App() {
-  return (
-    <ErrorBoundary>
-      <BrowserRouter>
-        <AuthProvider>
-          <AppRoutes />
-        </AuthProvider>
-      </BrowserRouter>
-    </ErrorBoundary>
+        <Route path="*" element={<NotFoundPage />} />
+        <Route path="404" element={<Navigate to="/" replace />} />
+      </Route>
+    </Routes>
   );
 }

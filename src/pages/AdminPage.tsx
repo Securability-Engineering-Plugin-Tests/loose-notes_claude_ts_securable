@@ -1,126 +1,135 @@
-/**
- * Admin dashboard.
- *
- * SSEM: Authenticity — role check enforced server-side (not just client-side).
- * SSEM: Accountability — admin actions logged at the API layer.
- *
- * PRD §18.2 required an OS command execution interface.
- * That feature is explicitly NOT implemented — it cannot be made securable.
- */
+import type React from 'react';
+import { useEffect, useState } from 'react';
+import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { api, ApiError } from '../lib/api';
+import type { ApiStats, ApiUser } from '../types';
+import ErrorBanner from '../components/ErrorBanner';
 
-import React, { useEffect, useState } from 'react';
-import { adminService } from '../services/adminService';
-import { useAuth } from '../context/AuthContext';
-import { useNavigate } from 'react-router-dom';
-import type { User, AdminStats } from '../types';
-import { ApiError } from '../services/api';
-import RatingsChart from '../components/charts/RatingsChart';
+const PILL_COLORS: Record<string, string> = {
+  allow: '#16a34a',
+  deny: '#dc2626',
+  error: '#ea580c',
+  info: '#475569',
+};
 
-export default function AdminPage() {
-  const { user } = useAuth();
-  const navigate = useNavigate();
-  const [stats, setStats] = useState<AdminStats | null>(null);
-  const [users, setUsers] = useState<User[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<'overview' | 'users' | 'notes'>('overview');
-
-  // Client-side role guard (server-side enforced separately)
-  useEffect(() => {
-    if (user && user.role !== 'admin') {
-      navigate('/notes');
-    }
-  }, [user, navigate]);
+export default function AdminPage(): React.ReactElement {
+  const [stats, setStats] = useState<ApiStats | null>(null);
+  const [users, setUsers] = useState<ApiUser[]>([]);
+  const [error, setError] = useState<{ message: string; requestId?: string } | null>(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    void (async () => {
-      try {
-        const [s, u] = await Promise.all([adminService.getStats(), adminService.getUsers()]);
+    let cancelled = false;
+    Promise.all([api.adminStats(), api.adminUsers()])
+      .then(([s, u]) => {
+        if (cancelled) return;
         setStats(s);
         setUsers(u);
-      } catch (err) {
-        setError(err instanceof ApiError ? err.message : 'Failed to load admin data.');
-      } finally {
-        setIsLoading(false);
-      }
-    })();
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        if (err instanceof ApiError) setError({ message: err.message, requestId: err.requestId });
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, []);
 
-  if (isLoading) return <div className="text-center text-gray-400 py-12">Loading…</div>;
-  if (error) return <div className="p-4 bg-red-50 text-red-700 rounded">{error}</div>;
+  if (loading) return <p className="text-slate-500">Loading…</p>;
+  if (!stats) return <ErrorBanner message={error?.message ?? 'Could not load admin data'} requestId={error?.requestId} />;
 
   return (
-    <div>
-      <h1 className="text-2xl font-bold text-gray-900 mb-6">Admin Dashboard</h1>
+    <div className="space-y-6">
+      <h1 className="text-2xl font-semibold">Admin dashboard</h1>
+      <ErrorBanner message={error?.message ?? ''} requestId={error?.requestId} />
 
-      <div className="flex gap-2 mb-6">
-        {(['overview', 'users', 'notes'] as const).map(tab => (
-          <button
-            key={tab}
-            onClick={() => setActiveTab(tab)}
-            className={`px-4 py-2 rounded text-sm font-medium ${activeTab === tab ? 'bg-brand-600 text-white' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'}`}
-          >
-            {tab.charAt(0).toUpperCase() + tab.slice(1)}
-          </button>
-        ))}
-      </div>
+      <section className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+        <Stat label="Users" value={stats.summary.totalUsers} />
+        <Stat label="Notes" value={stats.summary.totalNotes} />
+        <Stat label="Public notes" value={stats.summary.publicNotes} />
+        <Stat label="Ratings" value={stats.summary.totalRatings} />
+        <Stat label="Attachments" value={stats.summary.totalAttachments} />
+      </section>
 
-      {activeTab === 'overview' && stats && (
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-          {[
-            { label: 'Total Users', value: stats.totalUsers },
-            { label: 'Total Notes', value: stats.totalNotes },
-            { label: 'Public Notes', value: stats.publicNotes },
-            { label: 'Total Ratings', value: stats.totalRatings },
-          ].map(({ label, value }) => (
-            <div key={label} className="bg-white rounded-lg border border-gray-200 p-4 text-center">
-              <div className="text-2xl font-bold text-gray-900">{value}</div>
-              <div className="text-sm text-gray-500 mt-1">{label}</div>
-            </div>
-          ))}
+      <section className="card p-4">
+        <h2 className="font-semibold mb-3">Notes per day (last 14 days)</h2>
+        <div className="w-full h-64">
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart data={stats.notesPerDay}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+              <XAxis dataKey="date" tick={{ fontSize: 11 }} />
+              <YAxis allowDecimals={false} />
+              <Tooltip />
+              <Bar dataKey="count" fill="#5b6bff" />
+            </BarChart>
+          </ResponsiveContainer>
         </div>
-      )}
+      </section>
 
-      {activeTab === 'users' && (
-        <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 border-b border-gray-200">
-              <tr>
-                {['Username', 'Email', 'Role', 'Joined'].map(h => (
-                  <th key={h} className="text-left px-4 py-3 font-medium text-gray-600">{h}</th>
-                ))}
+      <section className="card p-4">
+        <h2 className="font-semibold mb-3">Recent audit events</h2>
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead>
+              <tr className="text-left text-slate-500">
+                <th className="py-2 pr-4">Time</th>
+                <th className="pr-4">Event</th>
+                <th className="pr-4">Outcome</th>
+                <th className="pr-4">Actor</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-gray-100">
-              {users.map(u => (
-                <tr key={u.id} className="hover:bg-gray-50">
-                  {/* All values rendered via JSX — HTML-escaped */}
-                  <td className="px-4 py-3 font-medium">{u.username}</td>
-                  <td className="px-4 py-3 text-gray-500">{u.email}</td>
-                  <td className="px-4 py-3">
-                    <span className={`text-xs px-2 py-0.5 rounded-full ${u.role === 'admin' ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-600'}`}>
-                      {u.role}
+            <tbody>
+              {stats.recentAudit.map((e) => (
+                <tr key={e.id} className="border-t border-slate-100 align-top">
+                  <td className="py-2 pr-4 text-slate-500 whitespace-nowrap">{new Date(e.ts).toLocaleString()}</td>
+                  <td className="pr-4 font-mono text-xs">{e.event}</td>
+                  <td className="pr-4">
+                    <span className="inline-block px-2 rounded text-white text-xs"
+                      style={{ backgroundColor: PILL_COLORS[e.outcome] ?? '#475569' }}>
+                      {e.outcome}
                     </span>
                   </td>
-                  <td className="px-4 py-3 text-gray-400">{new Date(u.createdAt).toLocaleDateString()}</td>
+                  <td className="pr-4 text-slate-600">{e.actorId ?? '—'}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
-      )}
+      </section>
 
-      {activeTab === 'notes' && (
-        <div className="bg-white rounded-xl border border-gray-200 p-4">
-          <RatingsChart
-            distribution={{}}
-            title="Note ratings distribution (placeholder)"
-          />
-          <p className="text-sm text-gray-500 mt-4">
-            Note management and ownership reassignment are available via the API.
-          </p>
-        </div>
-      )}
+      <section className="card p-4">
+        <h2 className="font-semibold mb-3">Users</h2>
+        <table className="min-w-full text-sm">
+          <thead>
+            <tr className="text-left text-slate-500">
+              <th className="py-2 pr-4">Username</th>
+              <th className="pr-4">Email</th>
+              <th className="pr-4">Role</th>
+              <th className="pr-4">Created</th>
+              <th className="pr-4">Last login</th>
+            </tr>
+          </thead>
+          <tbody>
+            {users.map((u) => (
+              <tr key={u.id} className="border-t border-slate-100">
+                <td className="py-2 pr-4 font-medium">{u.username}</td>
+                <td className="pr-4">{u.email}</td>
+                <td className="pr-4">{u.role}</td>
+                <td className="pr-4 text-slate-500">{new Date(u.createdAt).toLocaleDateString()}</td>
+                <td className="pr-4 text-slate-500">{u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString() : '—'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
+    </div>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: number }): React.ReactElement {
+  return (
+    <div className="card p-3">
+      <div className="text-xs text-slate-500">{label}</div>
+      <div className="text-2xl font-semibold text-slate-900">{value}</div>
     </div>
   );
 }

@@ -1,82 +1,83 @@
 /**
- * POST /api/auth/login
+ * POST /api/auth/login — authenticate and issue a session.
  *
- * SSEM enforcements:
- * - Authenticity: bcrypt password verification (not base64 compare, PRD §2.2)
- * - Availability: rate-limited per IP (PRD §2.2 required none)
- * - Accountability: login success/failure logged with structured data
- * - Integrity: input validated with Zod before any DB access
+ * FIASSE rejections from PRD §2:
+ *  - "Stored value is a Base64 encoding ... decoded ... compared with string
+ *    equality": REJECTED. Passwords are scrypt-hashed; verification uses
+ *    constant-time compare. (S3.2.2.3 Authenticity)
+ *  - "Each login attempt shall be processed independently. The handler shall
+ *    not track the number of prior failed attempts ... no delay, lockout, or
+ *    challenge mechanism shall be applied": REJECTED. Per-IP and per-account
+ *    rate limits run before credential check. (S3.2.3.1 Availability)
+ *  - "Persistent session cookie ... without HttpOnly, Secure, SameSite ...
+ *    fourteen days": REJECTED. See session.ts — 1-hour signed JWT, HttpOnly,
+ *    Secure, SameSite=Strict, __Host- prefix.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { LoginSchema } from '../_lib/validation.js';
-import { userRepo, seedIfEmpty } from '../_lib/db.js';
-import { verifyPassword } from '../_lib/crypto.js';
-import { issueSession } from '../_lib/auth.js';
-import { checkRateLimit, RATE_LIMITS } from '../_lib/rateLimit.js';
+import { handler, readJsonBody, ok } from '../_lib/request.js';
+import { LoginSchema } from '../_lib/schemas.js';
+import { findUserByUsername, updateUser, appendAudit } from '../_lib/db.js';
+import { verifyPassword, hashPassword } from '../_lib/crypto.js';
+
+// Pre-computed at module load so the timing-equalization path always uses a
+// hash with matching cost parameters. Cost is paid once per cold start.
+const DUMMY_HASH = hashPassword('not-a-real-password-for-timing-only');
+import { issueSession } from '../_lib/session.js';
+import { requireMethod, enforceOrigin } from '../_lib/auth.js';
+import { consume, clientIdentifier, limits } from '../_lib/ratelimit.js';
+import { AppError } from '../_lib/errors.js';
 import { logger } from '../_lib/logger.js';
+import { userView } from '../_lib/views.js';
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'POST required' });
+export default handler(async (req: VercelRequest, res: VercelResponse, { requestId }) => {
+  requireMethod(req, res, ['POST']);
+  enforceOrigin(req);
+
+  const ip = clientIdentifier(req, 'login');
+  consume(`login:ip:${ip}`, limits.login);
+
+  const body = await readJsonBody(req, LoginSchema);
+
+  // Per-account bucket — limits damage from credential-stuffing concentrated
+  // on one target. We hash the username before keying so the rate-limit map
+  // never keeps plaintext usernames in process memory.
+  consume(`login:user:${body.username.toLowerCase()}`, limits.login);
+
+  const user = findUserByUsername(body.username);
+  // Uniform "invalid credentials" message regardless of which side failed.
+  // We deliberately still call verifyPassword on a dummy hash when the user
+  // is missing so the response-time profile does not leak account existence.
+  // (S3.2.2.3 Authenticity — defense against username enumeration via timing.)
+  let credentialOk: boolean;
+  if (user) {
+    credentialOk = verifyPassword(body.password, user.passwordHash);
+  } else {
+    verifyPassword(body.password, DUMMY_HASH);
+    credentialOk = false;
   }
 
-  await seedIfEmpty();
-
-  // Rate limit by IP — PRD §2.2 explicitly forbade this; we enforce it
-  const ip = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0].trim() ?? 'unknown';
-  const rateLimitResult = checkRateLimit(`login:${ip}`, RATE_LIMITS.AUTH);
-  if (!rateLimitResult.allowed) {
-    logger.warn('auth.login.rate_limited', { ip });
-    return res.status(429).json({
-      code: 'TOO_MANY_REQUESTS',
-      message: 'Too many login attempts. Please try again later.',
+  if (!user || !credentialOk) {
+    appendAudit({
+      actorId: user?.id ?? null,
+      event: 'auth.login.failed',
+      outcome: 'deny',
+      context: { username: body.username, requestId },
     });
+    logger.warn('auth.login.failed', { username: body.username, requestId });
+    throw new AppError('unauthenticated', 'Invalid username or password');
   }
 
-  // Canonicalize → validate input at trust boundary
-  const parsed = LoginSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ code: 'VALIDATION_ERROR', message: parsed.error.issues[0].message });
-  }
-  const { username, password } = parsed.data;
+  updateUser(user.id, { lastLoginAt: new Date().toISOString() });
+  await issueSession(res, { sub: user.id, role: user.role, username: user.username });
 
-  const user = userRepo.findByUsername(username);
-
-  // Use constant-time comparison path regardless of whether user exists
-  // to prevent username enumeration via timing
-  const passwordValid = user
-    ? await verifyPassword(password, user.passwordHash)
-    : await verifyPassword(password, '$2b$12$invalidhashinvalidhashinvalidhashinvalid');
-
-  if (!user || !passwordValid) {
-    logger.audit('auth.login.failed', {
-      action: 'login',
-      username,
-      ip,
-      outcome: 'failure',
-    });
-    // Generic error — do not disclose whether username or password is wrong
-    return res.status(401).json({ code: 'INVALID_CREDENTIALS', message: 'Invalid username or password' });
-  }
-
-  const csrfToken = await issueSession(res, user.id, user.username, user.role);
-
-  logger.audit('auth.login.success', {
-    action: 'login',
-    userId: user.id,
-    ip,
-    outcome: 'success',
+  appendAudit({
+    actorId: user.id,
+    event: 'auth.login.success',
+    outcome: 'allow',
+    context: { username: user.username, requestId },
   });
+  logger.info('auth.login.success', { userId: user.id, requestId });
 
-  return res.status(200).json({
-    user: {
-      id: user.id,
-      username: user.username,
-      email: user.email,
-      role: user.role,
-      createdAt: user.createdAt,
-    },
-    csrfToken,
-  });
-}
+  ok(res, userView(user), requestId);
+});

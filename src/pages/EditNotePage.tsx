@@ -1,90 +1,76 @@
-import React, { useEffect, useState } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { useForm } from 'react-hook-form';
-import { zodResolver } from '@hookform/resolvers/zod';
-import { z } from 'zod';
-import { noteService } from '../services/noteService';
-import { ApiError } from '../services/api';
+import type React from 'react';
+import { FormEvent, useEffect, useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { api, ApiError } from '../lib/api';
+import ErrorBanner from '../components/ErrorBanner';
 
-const EditNoteSchema = z.object({
-  title: z.string().min(1, 'Title is required').max(200),
-  content: z.string().min(1, 'Content is required').max(50_000),
-  isPublic: z.boolean(),
-});
-type EditNoteData = z.infer<typeof EditNoteSchema>;
-
-export default function EditNotePage() {
+export default function EditNotePage(): React.ReactElement {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [serverError, setServerError] = useState<string | null>(null);
-  const [isLoaded, setIsLoaded] = useState(false);
-
-  const { register, handleSubmit, reset, formState: { errors, isSubmitting } } = useForm<EditNoteData>({
-    resolver: zodResolver(EditNoteSchema),
-  });
+  const [title, setTitle] = useState('');
+  const [content, setContent] = useState('');
+  const [isPublic, setIsPublic] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<{ message: string; requestId?: string } | null>(null);
 
   useEffect(() => {
     if (!id) return;
-    void (async () => {
-      try {
-        const note = await noteService.get(id);
-        reset({ title: note.title, content: note.content, isPublic: note.isPublic });
-        setIsLoaded(true);
-      } catch (err) {
-        setLoadError(err instanceof ApiError ? err.message : 'Failed to load note.');
-      }
-    })();
-  }, [id, reset]);
+    let cancelled = false;
+    api.getNote(id)
+      .then((res) => {
+        if (cancelled) return;
+        setTitle(res.note.title);
+        setContent(res.note.content);
+        setIsPublic(res.note.isPublic);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        if (err instanceof ApiError) setError({ message: err.message, requestId: err.requestId });
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [id]);
 
-  const onSubmit = async (data: EditNoteData) => {
+  const onSubmit = async (e: FormEvent): Promise<void> => {
+    e.preventDefault();
     if (!id) return;
-    setServerError(null);
+    setSubmitting(true);
+    setError(null);
     try {
-      await noteService.update(id, data);
-      navigate(`/notes/${encodeURIComponent(id)}`);
-    } catch (err) {
-      setServerError(err instanceof ApiError ? err.message : 'Update failed.');
+      await api.updateNote(id, { title, content, isPublic });
+      navigate(`/notes/${id}`);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) setError({ message: err.message, requestId: err.requestId });
+    } finally {
+      setSubmitting(false);
     }
   };
 
-  if (loadError) return <div className="p-4 bg-red-50 text-red-700 rounded">{loadError}</div>;
-  if (!isLoaded) return <div className="text-center text-gray-400 py-12">Loading…</div>;
+  if (loading) return <p className="text-slate-500">Loading…</p>;
 
   return (
-    <div className="max-w-2xl mx-auto">
-      <h1 className="text-2xl font-bold text-gray-900 mb-6">Edit note</h1>
-
-      {serverError && (
-        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700">{serverError}</div>
-      )}
-
-      <form onSubmit={void handleSubmit(onSubmit)} className="bg-white rounded-xl border border-gray-200 shadow-sm p-6 space-y-4">
+    <div className="max-w-2xl mx-auto card p-6">
+      <h1 className="text-xl font-semibold mb-4">Edit note</h1>
+      <form onSubmit={onSubmit} className="space-y-3">
         <div>
-          <label htmlFor="title" className="block text-sm font-medium text-gray-700 mb-1">Title</label>
-          <input id="title" type="text" {...register('title')} className="w-full border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-500" />
-          {errors.title && <p className="text-xs text-red-600 mt-1">{errors.title.message}</p>}
+          <label className="label">Title</label>
+          <input className="input" required maxLength={200}
+            value={title} onChange={(e) => setTitle(e.target.value)} />
         </div>
-
         <div>
-          <label htmlFor="content" className="block text-sm font-medium text-gray-700 mb-1">Content</label>
-          <textarea id="content" {...register('content')} rows={12} className="w-full border border-gray-300 rounded px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-brand-500 resize-y" />
-          {errors.content && <p className="text-xs text-red-600 mt-1">{errors.content.message}</p>}
+          <label className="label">Content</label>
+          <textarea className="input min-h-[12rem]" maxLength={40000}
+            value={content} onChange={(e) => setContent(e.target.value)} />
         </div>
-
-        <label className="flex items-center gap-2 text-sm text-gray-700">
-          <input type="checkbox" {...register('isPublic')} className="rounded" />
-          Make this note public
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={isPublic} onChange={(e) => setIsPublic(e.target.checked)} />
+          Public
         </label>
-
-        <div className="flex gap-3 pt-2">
-          <button type="submit" disabled={isSubmitting} className="bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white px-5 py-2 rounded text-sm font-medium">
-            {isSubmitting ? 'Saving…' : 'Save changes'}
-          </button>
-          <button type="button" onClick={() => navigate(`/notes/${encodeURIComponent(id ?? '')}`)} className="text-sm text-gray-500 hover:text-gray-700">
-            Cancel
-          </button>
-        </div>
+        <ErrorBanner message={error?.message ?? ''} requestId={error?.requestId} />
+        <button type="submit" className="btn-primary" disabled={submitting}>
+          {submitting ? 'Saving…' : 'Save'}
+        </button>
       </form>
     </div>
   );

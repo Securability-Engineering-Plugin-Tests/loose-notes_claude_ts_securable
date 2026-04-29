@@ -1,71 +1,75 @@
 /**
- * POST /api/auth/register
+ * POST /api/auth/register — create a new user account.
  *
- * SSEM enforcements:
- * - Integrity: full password policy enforcement (PRD §16.2 required none)
- * - Confidentiality: password hashed with bcrypt before storage
- * - Accountability: registration events logged
- * - Availability: rate-limited to prevent account-creation abuse
+ * FIASSE rejections from PRD §1:
+ *  - "Return a response message that specifically identifies the username as
+ *    unavailable" / "specifically identifies the email address as already in
+ *    use": REJECTED. We return a single uniform response that does not
+ *    enumerate which field is taken — preventing username/email enumeration
+ *    (S3.2.2.1 Confidentiality).
+ *  - "Pre-seeded accounts embedded in the application configuration layer":
+ *    REJECTED. See db.ts → bootstrapIfNeeded for the opt-in alternative.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { RegisterSchema } from '../_lib/validation.js';
-import { userRepo, seedIfEmpty } from '../_lib/db.js';
-import { hashPassword, hashSecurityAnswer } from '../_lib/crypto.js';
-import { checkRateLimit, RATE_LIMITS } from '../_lib/rateLimit.js';
+import { handler, readJsonBody, created } from '../_lib/request.js';
+import { RegisterSchema } from '../_lib/schemas.js';
+import {
+  createUser,
+  findUserByUsername,
+  findUserByEmail,
+  appendAudit,
+} from '../_lib/db.js';
+import { hashPassword } from '../_lib/crypto.js';
+import { issueSession } from '../_lib/session.js';
+import { requireMethod, enforceOrigin } from '../_lib/auth.js';
+import { consume, clientIdentifier, limits } from '../_lib/ratelimit.js';
+import { AppError } from '../_lib/errors.js';
 import { logger } from '../_lib/logger.js';
+import { userView } from '../_lib/views.js';
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'POST required' });
+export default handler(async (req: VercelRequest, res: VercelResponse, { requestId }) => {
+  requireMethod(req, res, ['POST']);
+  enforceOrigin(req);
+  consume(`register:${clientIdentifier(req, 'register')}`, limits.register);
+
+  const body = await readJsonBody(req, RegisterSchema);
+
+  const usernameTaken = findUserByUsername(body.username);
+  const emailTaken = findUserByEmail(body.email);
+
+  if (usernameTaken || emailTaken) {
+    // Uniform response: do not reveal which field collided. The structured
+    // log captures the detail server-side for ops visibility.
+    appendAudit({
+      actorId: null,
+      event: 'auth.register.collision',
+      outcome: 'deny',
+      context: {
+        usernameTaken: Boolean(usernameTaken),
+        emailTaken: Boolean(emailTaken),
+        requestId,
+      },
+    });
+    throw new AppError('conflict', 'Could not create account with the supplied details');
   }
 
-  await seedIfEmpty();
-
-  const ip = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0].trim() ?? 'unknown';
-  const rateLimitResult = checkRateLimit(`register:${ip}`, RATE_LIMITS.AUTH);
-  if (!rateLimitResult.allowed) {
-    return res.status(429).json({ code: 'TOO_MANY_REQUESTS', message: 'Too many requests. Try again later.' });
-  }
-
-  // Canonicalize → validate
-  const parsed = RegisterSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ code: 'VALIDATION_ERROR', message: parsed.error.issues[0].message });
-  }
-  const { username, email, password, securityQuestion, securityAnswer } = parsed.data;
-
-  // Check uniqueness — specific messages are acceptable at registration
-  if (userRepo.findByUsername(username)) {
-    return res.status(409).json({ code: 'USERNAME_TAKEN', message: 'Username is already in use' });
-  }
-  if (userRepo.findByEmail(email)) {
-    return res.status(409).json({ code: 'EMAIL_TAKEN', message: 'Email address is already registered' });
-  }
-
-  const [passwordHash, securityAnswerHash] = await Promise.all([
-    hashPassword(password),
-    hashSecurityAnswer(securityAnswer),
-  ]);
-
-  const user = userRepo.create({
-    username,
-    email,
-    passwordHash,
+  const user = createUser({
+    username: body.username,
+    email: body.email,
+    passwordHash: hashPassword(body.password),
     role: 'user',
-    securityQuestion,
-    securityAnswerHash,
   });
 
-  logger.audit('auth.register.success', {
-    action: 'register',
-    userId: user.id,
-    ip,
-    outcome: 'success',
-  });
+  await issueSession(res, { sub: user.id, role: user.role, username: user.username });
 
-  return res.status(201).json({
-    message: 'Account created successfully',
-    userId: user.id,
+  appendAudit({
+    actorId: user.id,
+    event: 'auth.register.success',
+    outcome: 'allow',
+    context: { username: user.username, requestId },
   });
-}
+  logger.info('auth.register.success', { userId: user.id, requestId });
+
+  created(res, userView(user), requestId);
+});

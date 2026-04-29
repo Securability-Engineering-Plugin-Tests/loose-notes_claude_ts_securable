@@ -1,57 +1,55 @@
 /**
- * GET /api/diagnostics
+ * GET /api/diagnostics — request introspection (admin only).
  *
- * Request diagnostics page for authenticated users.
- *
- * SSEM enforcements:
- * - Integrity: header values are HTML-encoded before insertion (PRD §25.2 required none)
- * - Confidentiality: sensitive headers (Authorization, Cookie) are redacted
- * - Authenticity: requires authentication
- *
- * PRD §25.2 required replacing '&' with '<br>' and assigning raw header values
- * directly to output — a reflected XSS vector. We encode all output here.
+ * FIASSE rejections from PRD §25:
+ *  - "Display all HTTP request header name-value pairs": REJECTED. We strip
+ *    Authorization, Cookie, and any Set-Cookie value; these would leak
+ *    session credentials to anyone with access to the page output.
+ *  - "Replace ampersands with <br>" / "assign directly to the output control
+ *    without applying HTML encoding": REJECTED. We return JSON; the client
+ *    renders the values via React, which escapes by default.
+ *  - PRD §18.2 + §25 implies diagnostics are accessible to any authenticated
+ *    user. REJECTED — diagnostics are admin-only since the data is operational.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { requireAuth } from './_lib/auth.js';
+import { handler, ok } from '../_lib/request.js';
+import { requireMethod, requireAdmin } from '../_lib/auth.js';
+import { config } from '../_lib/config.js';
 
-/** Headers that must never be reflected in diagnostics output. */
-const REDACTED_HEADERS = new Set(['authorization', 'cookie', 'x-csrf-token', 'x-api-key']);
+const SENSITIVE_HEADERS = new Set([
+  'authorization',
+  'cookie',
+  'set-cookie',
+  'x-vercel-deployment-url',
+  'x-real-ip',
+  'x-forwarded-for',
+]);
 
-function htmlEncode(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#x27;');
-}
+export default handler(async (req: VercelRequest, res: VercelResponse, { requestId }) => {
+  requireMethod(req, res, ['GET']);
+  await requireAdmin(req);
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  if (req.method !== 'GET') {
-    return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'GET required' });
-  }
-
-  const claims = await requireAuth(req, res);
-  if (!claims) return;
-
-  // Build safe header map — redact sensitive headers, encode all values
-  const safeHeaders: Record<string, string> = {};
+  const headers: Record<string, string> = {};
   for (const [name, value] of Object.entries(req.headers)) {
-    if (REDACTED_HEADERS.has(name.toLowerCase())) {
-      safeHeaders[name] = '[REDACTED]';
+    const k = name.toLowerCase();
+    if (SENSITIVE_HEADERS.has(k)) {
+      headers[k] = '[redacted]';
     } else {
-      // Encode the value before including it in any output
-      safeHeaders[name] = htmlEncode(String(value ?? ''));
+      headers[k] = Array.isArray(value) ? value.join(', ') : (value ?? '');
     }
   }
 
-  // Return as structured JSON — rendering/display is the frontend's responsibility
-  // The frontend must use React's default escaping (JSX), not dangerouslySetInnerHTML
-  return res.status(200).json({
+  ok(res, {
     method: req.method,
-    url: req.url,
-    headers: safeHeaders,
-    timestamp: new Date().toISOString(),
-  });
-}
+    path: req.url,
+    headers,
+    runtime: {
+      node: process.version,
+      production: config.isProduction,
+      cookieSecure: config.cookieSecure,
+      allowedOrigins: config.allowedOrigins,
+    },
+    requestId,
+  }, requestId);
+});

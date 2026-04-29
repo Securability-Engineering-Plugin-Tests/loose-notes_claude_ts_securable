@@ -1,108 +1,96 @@
 /**
- * GET    /api/notes/:id  — Get a note (owner or admin)
- * PUT    /api/notes/:id  — Update a note
- * DELETE /api/notes/:id  — Delete a note
+ * /api/notes/[id]
+ *   GET    — read one note (visibility check)
+ *   PATCH  — update one note (ownership check)
+ *   DELETE — delete one note (ownership check)
  *
- * SSEM enforcements:
- * - Integrity: server-side ownership check on every mutation
- *   (PRD §8.2, §9.2 explicitly required no ownership check — corrected here)
- * - Authenticity: requires valid session
- * - Accountability: mutations logged with user + resource
+ * FIASSE rejections:
+ *  - §8.2 / §9.2: PRD requires loading and updating/deleting without a
+ *    server-side ownership check, and without any CSRF token. REJECTED.
+ *    Every state-changing path goes through requireUser → findNoteForOwner,
+ *    plus enforceOrigin for CSRF defense-in-depth on top of SameSite=Strict.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { requireAuth, requireCsrf } from '../_lib/auth.js';
-import { noteRepo, ratingRepo } from '../_lib/db.js';
-import { UpdateNoteSchema } from '../_lib/validation.js';
-import { noteToPublic } from './index.js';
-import { logger } from '../_lib/logger.js';
-import { z } from 'zod';
+import {
+  handler, readJsonBody, ok, noContent,
+} from '../_lib/request.js';
+import { UpdateNoteSchema } from '../_lib/schemas.js';
+import {
+  findNoteForViewer, findNoteForOwner, updateNote, deleteNote,
+  findUserById, listRatingsForNote, listAttachmentsForNote, appendAudit,
+} from '../_lib/db.js';
+import { stripHtml } from '../_lib/sanitize.js';
+import { noteView, ratingView, attachmentView } from '../_lib/views.js';
+import {
+  requireMethod, requireUser, enforceOrigin, getAuthenticatedUser,
+} from '../_lib/auth.js';
+import { consume, limits } from '../_lib/ratelimit.js';
+import { AppError } from '../_lib/errors.js';
+import { Uuid } from '../_lib/schemas.js';
 
-const UuidSchema = z.string().uuid();
+export default handler(async (req: VercelRequest, res: VercelResponse, { requestId }) => {
+  const method = requireMethod(req, res, ['GET', 'PATCH', 'DELETE']);
+  const idParam = (req.query.id ?? '').toString();
+  const idCheck = Uuid.safeParse(idParam);
+  if (!idCheck.success) throw new AppError('not_found', 'Note not found');
+  const id = idCheck.data;
 
-export default async function handler(req: VercelRequest, res: VercelResponse) {
-  const claims = await requireAuth(req, res);
-  if (!claims) return;
+  if (method === 'GET') return read(req, res, requestId, id);
+  if (method === 'PATCH') return update(req, res, requestId, id);
+  return remove(req, res, requestId, id);
+});
 
-  // Validate note ID from route parameter
-  const idResult = UuidSchema.safeParse(req.query.id);
-  if (!idResult.success) {
-    return res.status(400).json({ code: 'INVALID_ID', message: 'Invalid note identifier' });
-  }
-  const noteId = idResult.data;
+async function read(req: VercelRequest, res: VercelResponse, requestId: string, id: string): Promise<void> {
+  const viewer = await getAuthenticatedUser(req);
+  const note = findNoteForViewer(id, viewer ? { id: viewer.id, role: viewer.role } : null);
+  if (!note) throw new AppError('not_found', 'Note not found');
+  const owner = findUserById(note.ownerId);
+  const ratings = listRatingsForNote(id).map((r) => ratingView(r, findUserById(r.raterId)));
+  const attachments = listAttachmentsForNote(id).map(attachmentView);
+  ok(res, { note: noteView(note, owner), ratings, attachments }, requestId);
+}
 
-  const note = noteRepo.findById(noteId);
-  if (!note) {
-    return res.status(404).json({ code: 'NOT_FOUND', message: 'Note not found' });
-  }
+async function update(req: VercelRequest, res: VercelResponse, requestId: string, id: string): Promise<void> {
+  enforceOrigin(req);
+  const user = await requireUser(req);
+  consume(`noteWrite:${user.id}`, limits.noteWrite);
 
-  if (req.method === 'GET') {
-    // Owners and admins may read; non-owners can only read public notes
-    if (note.ownerId !== claims.sub && claims.role !== 'admin' && !note.isPublic) {
-      logger.audit('note.access.denied', {
-        action: 'read_note',
-        userId: claims.sub,
-        resource: noteId,
-        outcome: 'failure',
-      });
-      return res.status(403).json({ code: 'FORBIDDEN', message: 'Access denied' });
-    }
-    const ratings = ratingRepo.findByNoteId(noteId);
-    return res.status(200).json(noteToPublic(note, ratings));
-  }
+  const note = findNoteForOwner(id, { id: user.id, role: user.role });
+  if (!note) throw new AppError('not_found', 'Note not found');
 
-  if (req.method === 'PUT') {
-    if (!requireCsrf(req, res)) return;
+  const body = await readJsonBody(req, UpdateNoteSchema);
+  const patch: { title?: string; content?: string; isPublic?: boolean } = {};
+  if (body.title !== undefined) patch.title = stripHtml(body.title);
+  if (body.content !== undefined) patch.content = stripHtml(body.content);
+  if (body.isPublic !== undefined) patch.isPublic = body.isPublic;
 
-    // Server-side ownership check — PRD §8.2 required this to be absent
-    if (note.ownerId !== claims.sub && claims.role !== 'admin') {
-      logger.audit('note.edit.denied', {
-        action: 'edit_note',
-        userId: claims.sub,
-        resource: noteId,
-        outcome: 'failure',
-      });
-      return res.status(403).json({ code: 'FORBIDDEN', message: 'You do not own this note' });
-    }
+  const updated = updateNote(id, patch);
+  if (!updated) throw new AppError('not_found', 'Note not found');
 
-    const parsed = UpdateNoteSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ code: 'VALIDATION_ERROR', message: parsed.error.issues[0].message });
-    }
+  appendAudit({
+    actorId: user.id,
+    event: 'note.update',
+    outcome: 'allow',
+    context: { noteId: id, requestId },
+  });
+  ok(res, noteView(updated, findUserById(updated.ownerId)), requestId);
+}
 
-    const updated = noteRepo.update(noteId, parsed.data);
-    logger.audit('note.updated', {
-      action: 'edit_note',
-      userId: claims.sub,
-      resource: noteId,
-      outcome: 'success',
-    });
-    return res.status(200).json(noteToPublic(updated));
-  }
+async function remove(req: VercelRequest, res: VercelResponse, requestId: string, id: string): Promise<void> {
+  enforceOrigin(req);
+  const user = await requireUser(req);
+  consume(`noteWrite:${user.id}`, limits.noteWrite);
 
-  if (req.method === 'DELETE') {
-    if (!requireCsrf(req, res)) return;
+  const note = findNoteForOwner(id, { id: user.id, role: user.role });
+  if (!note) throw new AppError('not_found', 'Note not found');
 
-    // Server-side ownership check — PRD §9.2 required this to be absent
-    if (note.ownerId !== claims.sub && claims.role !== 'admin') {
-      logger.audit('note.delete.denied', {
-        action: 'delete_note',
-        userId: claims.sub,
-        resource: noteId,
-        outcome: 'failure',
-      });
-      return res.status(403).json({ code: 'FORBIDDEN', message: 'You do not own this note' });
-    }
-
-    noteRepo.delete(noteId);
-    logger.audit('note.deleted', {
-      action: 'delete_note',
-      userId: claims.sub,
-      resource: noteId,
-      outcome: 'success',
-    });
-    return res.status(204).end();
-  }
-
-  return res.status(405).json({ code: 'METHOD_NOT_ALLOWED', message: 'GET, PUT, or DELETE required' });
+  deleteNote(id);
+  appendAudit({
+    actorId: user.id,
+    event: 'note.delete',
+    outcome: 'allow',
+    context: { noteId: id, requestId },
+  });
+  noContent(res, requestId);
 }

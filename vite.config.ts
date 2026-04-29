@@ -1,35 +1,23 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import { resolve } from 'path';
 
-// https://vitejs.dev/config/
+// Vite dev server proxies /api/* to the Vercel dev server (vercel dev) when running
+// `npm run dev:full`. For pure-frontend dev (`npm run dev`) the proxy points to
+// localhost:3000 by default and falls back gracefully when no API is running.
 export default defineConfig({
   plugins: [react()],
-  resolve: {
-    alias: {
-      '@': resolve(__dirname, './src'),
-    },
-  },
   server: {
+    port: 5173,
     proxy: {
-      // Proxy /api requests to local Vercel dev server during development
       '/api': {
-        target: 'http://localhost:3000',
-        changeOrigin: true,
+        target: process.env.API_PROXY_TARGET ?? 'http://localhost:3000',
+        changeOrigin: false,
       },
     },
   },
   build: {
+    target: 'es2022',
+    sourcemap: true,
     outDir: 'dist',
-    sourcemap: false, // Disable source maps in production to reduce information disclosure
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          react: ['react', 'react-dom'],
-          router: ['react-router-dom'],
-          charts: ['recharts'],
-        },
-      },
-    },
   },
 });

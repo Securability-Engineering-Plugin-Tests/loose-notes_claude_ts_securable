@@ -1,95 +1,60 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import type React from 'react';
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { noteService } from '../services/noteService';
-import NoteCard from '../components/notes/NoteCard';
-import type { Note } from '../types';
-import { ApiError } from '../services/api';
+import { api, ApiError } from '../lib/api';
+import type { ApiNote } from '../types';
+import NoteCard from '../components/NoteCard';
+import ErrorBanner from '../components/ErrorBanner';
 
-export default function NotesPage() {
-  const [notes, setNotes] = useState<Note[]>([]);
-  const [total, setTotal] = useState(0);
-  const [page, setPage] = useState(1);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+export default function NotesPage(): React.ReactElement {
+  const [items, setItems] = useState<ApiNote[]>([]);
+  const [filter, setFilter] = useState<'all' | 'mine' | 'public'>('mine');
+  const [q, setQ] = useState('');
+  const [error, setError] = useState<{ message: string; requestId?: string } | null>(null);
+  const [loading, setLoading] = useState(false);
 
-  const PAGE_SIZE = 20;
-
-  const loadNotes = useCallback(async () => {
-    setIsLoading(true);
-    setError(null);
-    try {
-      const result = await noteService.list(page, PAGE_SIZE);
-      setNotes(result.items);
-      setTotal(result.total);
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Failed to load notes.');
-    } finally {
-      setIsLoading(false);
-    }
-  }, [page]);
-
-  useEffect(() => { void loadNotes(); }, [loadNotes]);
-
-  const handleDelete = async (id: string) => {
-    if (!confirm('Delete this note permanently?')) return;
-    try {
-      await noteService.delete(id);
-      await loadNotes();
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Delete failed.');
-    }
-  };
-
-  const totalPages = Math.ceil(total / PAGE_SIZE);
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    api.searchNotes({ q, filter, limit: 30 })
+      .then((res) => { if (!cancelled) setItems(res.items); })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        if (err instanceof ApiError) setError({ message: err.message, requestId: err.requestId });
+        else setError({ message: 'Could not load notes' });
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [q, filter]);
 
   return (
-    <div>
-      <div className="flex justify-between items-center mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">My Notes</h1>
-        <Link
-          to="/notes/new"
-          className="bg-brand-600 hover:bg-brand-700 text-white px-4 py-2 rounded text-sm font-medium"
-        >
-          + New note
-        </Link>
+    <div className="space-y-4">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <h1 className="text-xl font-semibold">Notes</h1>
+        <Link to="/notes/new" className="btn-primary">New note</Link>
       </div>
 
-      {error && (
-        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-sm text-red-700">{error}</div>
-      )}
+      <div className="flex items-center gap-2">
+        <input
+          className="input flex-1" placeholder="Search…"
+          value={q} onChange={(e) => setQ(e.target.value)} maxLength={200}
+        />
+        <select className="input w-40" value={filter} onChange={(e) => setFilter(e.target.value as 'all' | 'mine' | 'public')}>
+          <option value="mine">My notes</option>
+          <option value="public">Public notes</option>
+          <option value="all">Everything visible</option>
+        </select>
+      </div>
 
-      {isLoading ? (
-        <div className="text-center text-gray-400 py-12">Loading…</div>
-      ) : notes.length === 0 ? (
-        <div className="text-center text-gray-400 py-12">
-          <p>You haven't created any notes yet.</p>
-          <Link to="/notes/new" className="mt-2 inline-block text-brand-600 hover:underline">Create your first note</Link>
-        </div>
+      <ErrorBanner message={error?.message ?? ''} requestId={error?.requestId} />
+
+      {loading ? (
+        <p className="text-slate-500 text-sm">Loading…</p>
+      ) : items.length === 0 ? (
+        <p className="text-slate-500 text-sm">No notes match the current filter.</p>
       ) : (
-        <div className="space-y-3">
-          {notes.map(note => (
-            <NoteCard key={note.id} note={note} onDelete={() => void handleDelete(note.id)} />
-          ))}
-        </div>
-      )}
-
-      {totalPages > 1 && (
-        <div className="flex justify-center gap-2 mt-6">
-          <button
-            onClick={() => setPage(p => Math.max(1, p - 1))}
-            disabled={page === 1}
-            className="px-3 py-1 text-sm border rounded disabled:opacity-40"
-          >
-            Previous
-          </button>
-          <span className="px-3 py-1 text-sm text-gray-600">{page} / {totalPages}</span>
-          <button
-            onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-            disabled={page === totalPages}
-            className="px-3 py-1 text-sm border rounded disabled:opacity-40"
-          >
-            Next
-          </button>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {items.map((n) => <NoteCard key={n.id} note={n} />)}
         </div>
       )}
     </div>

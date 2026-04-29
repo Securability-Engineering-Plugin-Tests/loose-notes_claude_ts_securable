@@ -1,192 +1,174 @@
-/**
- * Note detail view.
- *
- * SSEM: Integrity — note content rendered via DOMPurify before
- * dangerouslySetInnerHTML. Rating comments rendered via JSX (escaped).
- * PRD §6.2 required direct HTML insertion without encoding.
- */
+import type React from 'react';
+import { FormEvent, useEffect, useState } from 'react';
+import { Link, useNavigate, useParams } from 'react-router-dom';
+import { api, ApiError } from '../lib/api';
+import type { ApiAttachment, ApiNote, ApiRating } from '../types';
+import { useAuth } from '../lib/auth';
+import RatingChart from '../components/RatingChart';
+import ErrorBanner from '../components/ErrorBanner';
 
-import React, { useEffect, useState } from 'react';
-import { useParams, useNavigate, Link } from 'react-router-dom';
-import { noteService } from '../services/noteService';
-import { sanitizeNoteContent } from '../utils/sanitization';
-import RatingsChart from '../components/charts/RatingsChart';
-import type { Note, Rating } from '../types';
-import { ApiError } from '../services/api';
-import { useAuth } from '../context/AuthContext';
-
-export default function NoteDetailPage() {
+export default function NoteDetailPage(): React.ReactElement {
   const { id } = useParams<{ id: string }>();
-  const { user } = useAuth();
   const navigate = useNavigate();
-  const [note, setNote] = useState<Note | null>(null);
-  const [ratings, setRatings] = useState<Rating[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [shareUrl, setShareUrl] = useState<string | null>(null);
-  const [ratingForm, setRatingForm] = useState({ score: 5, comment: '' });
-  const [ratingError, setRatingError] = useState<string | null>(null);
+  const { user } = useAuth();
+  const [note, setNote] = useState<ApiNote | null>(null);
+  const [ratings, setRatings] = useState<ApiRating[]>([]);
+  const [attachments, setAttachments] = useState<ApiAttachment[]>([]);
+  const [error, setError] = useState<{ message: string; requestId?: string } | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  const [score, setScore] = useState(5);
+  const [comment, setComment] = useState('');
+  const [shareLink, setShareLink] = useState<string | null>(null);
 
   useEffect(() => {
     if (!id) return;
-    void (async () => {
-      try {
-        const [n, r] = await Promise.all([
-          noteService.get(id),
-          noteService.getRatings(id),
-        ]);
-        setNote(n);
-        setRatings(r);
-      } catch (err) {
-        setError(err instanceof ApiError ? err.message : 'Failed to load note.');
-      } finally {
-        setIsLoading(false);
-      }
-    })();
+    let cancelled = false;
+    setLoading(true);
+    api.getNote(id)
+      .then((res) => {
+        if (cancelled) return;
+        setNote(res.note);
+        setRatings(res.ratings);
+        setAttachments(res.attachments);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        if (err instanceof ApiError) setError({ message: err.message, requestId: err.requestId });
+        else setError({ message: 'Could not load note' });
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, [id]);
 
-  const handleShare = async () => {
-    if (!note) return;
-    try {
-      const result = await noteService.createShareLink(note.id);
-      setShareUrl(result.url);
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Could not generate share link.');
-    }
-  };
-
-  const handleDelete = async () => {
-    if (!note || !confirm('Delete this note permanently?')) return;
-    try {
-      await noteService.delete(note.id);
-      navigate('/notes');
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : 'Delete failed.');
-    }
-  };
-
-  const handleRate = async (e: React.FormEvent) => {
+  const onRate = async (e: FormEvent): Promise<void> => {
     e.preventDefault();
-    setRatingError(null);
-    if (!note) return;
+    if (!id) return;
     try {
-      await noteService.rate(note.id, ratingForm.score, ratingForm.comment);
-      const updated = await noteService.getRatings(note.id);
-      setRatings(updated);
-      setRatingForm({ score: 5, comment: '' });
-    } catch (err) {
-      setRatingError(err instanceof ApiError ? err.message : 'Rating failed.');
+      const r = await api.rateNote({ noteId: id, score, comment });
+      setRatings((prev) => [r, ...prev]);
+      setComment('');
+    } catch (err: unknown) {
+      if (err instanceof ApiError) setError({ message: err.message, requestId: err.requestId });
     }
   };
 
-  if (isLoading) return <div className="text-center text-gray-400 py-12">Loading…</div>;
-  if (error) return <div className="p-4 bg-red-50 text-red-700 rounded">{error}</div>;
-  if (!note) return null;
+  const onShare = async (): Promise<void> => {
+    if (!id) return;
+    try {
+      const res = await api.shareNote({ noteId: id, ttlMinutes: 60 * 24 });
+      const url = new URL(res.sharePath, window.location.origin).toString();
+      setShareLink(url);
+    } catch (err: unknown) {
+      if (err instanceof ApiError) setError({ message: err.message, requestId: err.requestId });
+    }
+  };
 
-  const isOwner = user?.id === note.ownerId;
+  const onDelete = async (): Promise<void> => {
+    if (!id) return;
+    if (!window.confirm('Delete this note? This cannot be undone.')) return;
+    try {
+      await api.deleteNote(id);
+      navigate('/notes', { replace: true });
+    } catch (err: unknown) {
+      if (err instanceof ApiError) setError({ message: err.message, requestId: err.requestId });
+    }
+  };
 
-  // Build rating distribution for the chart
-  const distribution: Record<number, number> = {};
-  ratings.forEach(r => { distribution[r.score] = (distribution[r.score] ?? 0) + 1; });
+  if (loading) return <p className="text-slate-500">Loading…</p>;
+  if (!note) return <ErrorBanner message={error?.message ?? 'Note not found'} requestId={error?.requestId} />;
+
+  const isOwner = user?.id === note.ownerId || user?.role === 'admin';
 
   return (
-    <div className="max-w-3xl mx-auto space-y-6">
-      <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
-        <div className="flex justify-between items-start mb-4">
-          {/* Title rendered via JSX — HTML-escaped */}
-          <h1 className="text-2xl font-bold text-gray-900">{note.title}</h1>
-          <span className={`text-xs px-2 py-0.5 rounded-full ${note.isPublic ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'}`}>
-            {note.isPublic ? 'Public' : 'Private'}
-          </span>
-        </div>
+    <div className="space-y-6">
+      <ErrorBanner message={error?.message ?? ''} requestId={error?.requestId} />
 
-        <div className="text-sm text-gray-400 mb-4">
-          by {note.ownerUsername} · {new Date(note.createdAt).toLocaleDateString()}
-        </div>
-
-        {/* Content: sanitized HTML from DOMPurify before dangerouslySetInnerHTML */}
-        <div
-          className="prose prose-sm max-w-none text-gray-700"
-          dangerouslySetInnerHTML={{ __html: sanitizeNoteContent(note.content) }}
-        />
-
-        {isOwner && (
-          <div className="flex gap-3 mt-6 pt-4 border-t border-gray-100">
-            <Link
-              to={`/notes/${encodeURIComponent(note.id)}/edit`}
-              className="text-sm text-brand-600 hover:underline"
-            >
-              Edit
-            </Link>
-            <button onClick={() => void handleShare()} className="text-sm text-brand-600 hover:underline">
-              Share
-            </button>
-            <button onClick={() => void handleDelete()} className="text-sm text-red-500 hover:underline">
-              Delete
-            </button>
+      <article className="card p-6 space-y-3">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h1 className="text-2xl font-bold text-slate-900">{note.title}</h1>
+            <p className="text-xs text-slate-500 mt-1">
+              {note.ownerUsername ? `by ${note.ownerUsername} · ` : ''}
+              {new Date(note.updatedAt).toLocaleString()}
+              {note.isPublic ? ' · public' : ' · private'}
+            </p>
           </div>
-        )}
-
-        {shareUrl && (
-          <div className="mt-3 p-3 bg-brand-50 border border-brand-200 rounded text-sm">
-            Share link: <code className="break-all">{shareUrl}</code>
-          </div>
-        )}
-      </div>
-
-      {/* Ratings */}
-      <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">
-          Ratings ({ratings.length})
-        </h2>
-
-        {ratings.length > 0 && <RatingsChart distribution={distribution} />}
-
-        <div className="space-y-3 mt-4">
-          {ratings.map(r => (
-            <div key={r.id} className="border border-gray-100 rounded p-3">
-              <div className="flex justify-between text-sm text-gray-500 mb-1">
-                {/* username and date rendered via JSX — escaped */}
-                <span>{r.username}</span>
-                <span>{'★'.repeat(r.score)}{'☆'.repeat(5 - r.score)}</span>
-              </div>
-              {/* comment rendered via JSX — escaped (PRD §6.2 required raw HTML) */}
-              {r.comment && <p className="text-sm text-gray-700">{r.comment}</p>}
+          {isOwner && (
+            <div className="flex gap-2">
+              <Link to={`/notes/${note.id}/edit`} className="btn-secondary">Edit</Link>
+              <button type="button" className="btn-danger" onClick={onDelete}>Delete</button>
             </div>
-          ))}
+          )}
         </div>
+        <div className="text-slate-800 whitespace-pre-wrap break-words">{note.content || '(empty)'}</div>
+      </article>
 
+      <section className="card p-4">
+        <h2 className="font-semibold mb-2">Attachments</h2>
+        {attachments.length === 0 ? (
+          <p className="text-sm text-slate-500">No attachments.</p>
+        ) : (
+          <ul className="space-y-1 text-sm">
+            {attachments.map((a) => (
+              <li key={a.id} className="flex items-center justify-between">
+                <span className="truncate">{a.originalName}</span>
+                <a className="text-brand-600 hover:underline" href={`/api/attachments/${a.id}`}>Download</a>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      {isOwner && (
+        <section className="card p-4 space-y-2">
+          <h2 className="font-semibold">Sharing</h2>
+          <p className="text-sm text-slate-600">
+            Share links use a 256-bit cryptographically random token and expire automatically.
+          </p>
+          <button type="button" className="btn-secondary" onClick={onShare}>
+            Generate share link (24h)
+          </button>
+          {shareLink && (
+            <div className="text-xs bg-slate-100 p-2 rounded break-all select-all">{shareLink}</div>
+          )}
+        </section>
+      )}
+
+      <section className="card p-4 space-y-4">
+        <h2 className="font-semibold">Ratings &amp; comments</h2>
+        <RatingChart ratings={ratings} />
         {user && (
-          <form onSubmit={(e) => void handleRate(e)} className="mt-4 space-y-3 border-t pt-4">
-            <h3 className="text-sm font-medium text-gray-700">Leave a rating</h3>
-            {ratingError && <p className="text-sm text-red-600">{ratingError}</p>}
+          <form onSubmit={onRate} className="space-y-2">
             <div className="flex items-center gap-2">
-              <label htmlFor="score" className="text-sm text-gray-600">Score</label>
-              <select
-                id="score"
-                value={ratingForm.score}
-                onChange={e => setRatingForm(f => ({ ...f, score: Number(e.target.value) }))}
-                className="border border-gray-300 rounded px-2 py-1 text-sm"
-              >
-                {[1,2,3,4,5].map(s => <option key={s} value={s}>{s}</option>)}
+              <label htmlFor="score" className="text-sm">Score</label>
+              <select id="score" className="input w-24" value={score} onChange={(e) => setScore(Number(e.target.value))}>
+                {[1, 2, 3, 4, 5].map((s) => <option key={s} value={s}>{s}</option>)}
               </select>
             </div>
             <textarea
-              value={ratingForm.comment}
-              onChange={e => setRatingForm(f => ({ ...f, comment: e.target.value.slice(0, 1000) }))}
-              placeholder="Optional comment…"
-              rows={3}
-              className="w-full border border-gray-300 rounded px-3 py-2 text-sm resize-none"
+              className="input"
+              placeholder="Comment (optional)"
+              maxLength={2000}
+              value={comment}
+              onChange={(e) => setComment(e.target.value)}
             />
-            <button
-              type="submit"
-              className="bg-brand-600 hover:bg-brand-700 text-white px-4 py-1.5 rounded text-sm"
-            >
-              Submit rating
-            </button>
+            <button type="submit" className="btn-primary">Submit rating</button>
           </form>
         )}
-      </div>
+        <ul className="divide-y divide-slate-200">
+          {ratings.map((r) => (
+            <li key={r.id} className="py-2">
+              <div className="text-sm">
+                <span className="font-medium">{'★'.repeat(r.score)}</span>
+                <span className="text-slate-500 ml-2">{r.raterUsername ?? 'anonymous'}</span>
+                <span className="text-slate-400 text-xs ml-2">{new Date(r.createdAt).toLocaleString()}</span>
+              </div>
+              {r.comment && <p className="text-sm text-slate-700 mt-1 whitespace-pre-wrap">{r.comment}</p>}
+            </li>
+          ))}
+        </ul>
+      </section>
     </div>
   );
 }
